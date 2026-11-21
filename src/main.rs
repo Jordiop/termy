@@ -3,6 +3,9 @@
 //! Entry point: starts the `winit` event loop with [`app::App`], which owns
 //! the sessions, workspace, renderer, AI monitor and config hot-reload.
 
+// Release builds on Windows are GUI apps: no extra console window.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod ai_monitor;
 mod app;
 mod chrome;

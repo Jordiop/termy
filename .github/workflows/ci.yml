@@ -1,0 +1,42 @@
+# Lint + tests on every push to main and every pull request.
+# Linux only: it's the cheapest runner (1x minutes on private repos).
+# Windows and macOS are compiled and tested in release.yml.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A newer push to the same branch cancels the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: clippy + tests (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # The renderer tests need a real monospace font.
+      - name: Install fonts
+        run: sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends fonts-dejavu-core
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked

@@ -1,0 +1,102 @@
+# Builds macOS / Windows / Linux packages and publishes a GitHub Release
+# when a version tag is pushed:
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# The tag must match `version` in Cargo.toml.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS (Apple Silicon)
+            os: macos-14
+          - name: Windows (x86_64)
+            os: windows-latest
+          # Oldest supported image → older glibc → runs on more distros.
+          - name: Linux (x86_64)
+            os: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches Cargo.toml version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}"
+            exit 1
+          fi
+          echo "VERSION=${version}" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # macOS: .app bundle + .dmg (tests already run on the dev machine and
+      # in CI; macOS minutes cost 10x on private repos).
+      - name: Bundle macOS app
+        if: runner.os == 'macOS'
+        run: scripts/bundle-macos.sh
+
+      # Windows: run the test suite (ConPTY code paths only run here), then
+      # build the GUI executable.
+      - name: Test (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test --locked
+
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo build --release --locked
+          mkdir -p dist
+          7z a "dist/termy-${VERSION}-windows-x86_64.zip" ./target/release/termy.exe README.md
+
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --locked
+          mkdir -p dist/termy-${VERSION}
+          cp target/release/termy README.md dist/termy-${VERSION}/
+          tar -C dist -czf "dist/termy-${VERSION}-linux-x86_64.tar.gz" "termy-${VERSION}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: termy-${{ runner.os }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
