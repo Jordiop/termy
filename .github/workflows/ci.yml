@@ -1,15 +1,11 @@
-# Lint + tests on every push to main and every pull request.
-# Linux only: it's the cheapest runner (1x minutes on private repos).
-# Windows and macOS are compiled and tested in release.yml.
+# Lint + tests on every pull request to main (before merging).
+# Merges to main run the same checks inside release.yml.
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
 
-# A newer push to the same branch cancels the run in progress.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
