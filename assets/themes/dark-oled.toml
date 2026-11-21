@@ -1,0 +1,44 @@
+name = "Dark OLED"
+
+[colors]
+foreground = "#d4d4d4"
+background = "#000000"
+cursor = "#d4d4d4"
+cursor_text = "#000000"
+selection_background = "#2a2a2a"
+
+[colors.normal]
+black = "#1b1b1b"
+red = "#e5534b"
+green = "#57ab5a"
+yellow = "#e0a040"
+blue = "#6cb6ff"
+magenta = "#dcbdfb"
+cyan = "#56d4dd"
+white = "#b8b8b8"
+
+[colors.bright]
+black = "#606060"
+red = "#ff7b72"
+green = "#7ee787"
+yellow = "#f2cc60"
+blue = "#91cbff"
+magenta = "#e2c5ff"
+cyan = "#76e3ea"
+white = "#ffffff"
+
+# Chrome palette sampled from the reference screenshot (docs/DESIGN.md).
+[ui]
+chrome_background = "#0d0d0d"
+input_background = "#080808"
+button_background = "#181818"
+pill_selected_background = "#202020"
+border = "#1b1b1b"
+text_primary = "#b8b8b8"
+text_dim = "#606060"
+accent = "#d97757"
+status_working = "#606060"
+status_waiting = "#e0a040"
+status_done = "#4caf6a"
+diff_add_background = "#062400"
+diff_delete_background = "#350400"

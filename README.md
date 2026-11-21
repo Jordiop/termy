@@ -1,0 +1,87 @@
+# termy
+
+A native, GPU-rendered terminal workspace for AI-agent workflows: multiple
+sessions grouped by project, tabs and splits, and a **100% local** token
+monitor for Claude Code, Codex and Gemini CLI. Zero telemetry: there isn't a
+single networking crate in the dependency tree.
+
+Runs on macOS (Metal), Windows (DirectX 12 + ConPTY) and Linux (Vulkan, Wayland/X11).
+
+## Build
+
+Requires Rust ≥ 1.95.
+
+```sh
+cargo run --release
+```
+
+## Shortcuts (defaults)
+
+| Action | macOS | Windows / Linux |
+|---|---|---|
+| New session | ⌘T | Ctrl+Shift+T |
+| Split vertically / horizontally | ⌘D / ⇧⌘D | Ctrl+Shift+D / Ctrl+Shift+E |
+| Close tab | ⌘W | Ctrl+Shift+W |
+| Next / previous tab | ⇧⌘] / ⇧⌘[ | Ctrl+Tab / Ctrl+Shift+Tab |
+| Next pane | ⌘] | Ctrl+Shift+] |
+| Toggle sidebar | ⌘B | Ctrl+Shift+B |
+| Search sessions | ⌘K | Ctrl+Shift+K |
+| Settings | ⌘, | Ctrl+, |
+| Copy / paste | ⌘C / ⌘V | Ctrl+Shift+C / Ctrl+Shift+V |
+| Font size + / − / reset | ⌘= / ⌘- / ⌘0 | Ctrl+= / Ctrl+- / Ctrl+0 |
+| Reload config | ⇧⌘R | Ctrl+Shift+R |
+
+On Windows/Linux, letter shortcuts use Ctrl+Shift so plain Ctrl+letter keeps
+reaching the shell. Everything is rebindable in Settings → Keybindings (press
+the new combination) or in `[keybindings]`.
+
+## Configuration
+
+`~/.config/termy/config.toml` (or `$XDG_CONFIG_HOME/termy`, or
+`$TERMY_CONFIG_DIR`) is created on first run. Changes apply instantly, whether
+you edit the file or use the settings panel. Saving from the panel keeps your
+comments and formatting.
+
+* `[window]` opacity, padding, decorations, initial size, sidebar, pane footer
+* `[font]` family, size, line height, ligatures
+* `[cursor]` shape (`block` / `beam` / `underline`), blink
+* `[terminal]` shell and args, working directory, scrollback, scroll speed,
+  `option_as_alt` (macOS), extra environment variables
+* `[appearance]` `theme`: one of `dark-oled`, `ghostty-dark`, `catppuccin-mocha`,
+  `tokyo-night`, `gruvbox-dark`, `solarized-light`, or your own
+  `~/.config/termy/themes/<name>.toml` (same format as `assets/themes/`)
+* `[monitor]` and `[[agents]]`: agent profiles and token budgets
+
+```toml
+[[agents]]
+name = "Claude Code"
+command = "claude"
+icon = "claude"
+color = "#d97757"
+metrics = { kind = "claude_code", path = "~/.claude/projects" }
+budget = { weekly_tokens = 5000000, weekly_reset = "mon 09:00" }  # UTC; omit for rolling 7 days
+```
+
+Metrics sources: `claude_code`, `codex`, `gemini_cli`, `jsonl` (any log, with
+fields mapped via JSON pointers) and `command` (a local program that prints
+`{"used": N, "limit": N, "resets_at": "…"}`).
+
+## Privacy
+
+The token monitor only reads files the agents already write on your machine.
+termy never opens a network connection.
+
+## Development
+
+```sh
+cargo test     # 76 tests: config, themes, PTY, VT emulation, token parsing, layout, input
+cargo clippy --all-targets
+```
+
+`TERMY_CAPTURE=frame.bmp` saves a rendered frame after
+`TERMY_CAPTURE_DELAY_MS` (default 2000) and exits. `TERMY_DEMO_INPUT` types into
+the first session and `TERMY_DEMO_ACTIONS=split_vertical,toggle_settings` runs
+keybinding actions at startup. These are useful for checking rendering without
+screen-recording permissions.
+
+Design notes and the sampled palette: [`docs/DESIGN.md`](docs/DESIGN.md).

@@ -1,0 +1,77 @@
+[package]
+name = "termy"
+version = "0.1.0"
+edition = "2024"
+# egui / egui-wgpu / egui-winit 0.37 and parking_lot 0.13 require Rust 1.95.
+rust-version = "1.95"
+description = "Native multi-session terminal workspace for AI-agent workflows. GPU-rendered, zero telemetry."
+license = "MIT OR Apache-2.0"
+publish = false
+
+# ---------------------------------------------------------------------------
+# Version matrix (verified against crates.io dependency metadata):
+#
+#   wgpu 30.x  <── glyphon 0.12   (wgpu ^30.0.0)
+#              <── egui-wgpu 0.37 (wgpu ^30.0)
+#   winit 0.30.13 <── egui-winit 0.37 / egui-wgpu 0.37 (winit ^0.30.13)
+#
+# winit 0.31 is still in beta and egui 0.37 is built on 0.30, so we stay on
+# 0.30.x (ApplicationHandler API). Bump all of these together, never alone.
+#
+# Zero telemetry: no networking/HTTP crates. egui-winit's default `links`
+# feature (webbrowser) and `accesskit` are deliberately disabled.
+# ---------------------------------------------------------------------------
+
+[dependencies]
+# Window & events
+winit = "0.30.13"
+
+# GPU
+wgpu = "30.0.2"
+pollster = "1"
+bytemuck = { version = "1", features = ["derive"] }
+
+# Text
+glyphon = "0.12.0"
+
+# Settings overlay
+egui = "0.37.0"
+egui-wgpu = { version = "0.37.0", default-features = false, features = ["winit", "wayland", "x11", "macos-window-resize-jitter-fix"] }
+egui-winit = { version = "0.37.0", default-features = false, features = ["clipboard", "wayland", "x11"] }
+
+# Terminal emulation (one `Term` per session; re-exports `vte`) & PTY
+alacritty_terminal = "0.26.0"
+portable-pty = "0.9.0"
+
+# Concurrency
+parking_lot = "0.13.0"
+crossbeam-channel = "0.5.15"
+
+# Config, themes, hot-reload and the local AI token monitor (JSONL logs)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.2"
+# Format-preserving writes: saving from the UI keeps the user's comments/layout.
+toml_edit = "0.25"
+dirs = "7"
+notify = "9"
+
+# Clipboard
+arboard = "3.7"
+
+# Logging (local stderr only)
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev.package."*"]
+# Keep dependencies (wgpu, cosmic-text, ...) fast in debug builds.
+opt-level = 2
