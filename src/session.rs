@@ -705,6 +705,11 @@ impl Session {
         self.shared.attention.store(false, Ordering::Release);
     }
 
+    /// PID of the process running in the PTY (root of the session's tree).
+    pub fn pid(&self) -> Option<u32> {
+        self.pty.pid()
+    }
+
     /// Text an app asked to put on the clipboard (OSC 52).
     pub fn take_clipboard_request(&self) -> Option<String> {
         self.shared.clipboard_request.lock().take()

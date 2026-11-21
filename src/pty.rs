@@ -64,7 +64,6 @@ pub struct PtyHandle {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer_tx: Sender<Vec<u8>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
-    #[cfg_attr(not(test), allow(dead_code))]
     pid: Option<u32>,
 }
 
@@ -165,7 +164,6 @@ impl PtyHandle {
         }
     }
 
-    #[cfg(test)]
     pub fn pid(&self) -> Option<u32> {
         self.pid
     }

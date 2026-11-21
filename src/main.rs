@@ -13,6 +13,7 @@ mod config;
 mod input;
 mod pty;
 mod renderer;
+mod resources;
 mod session;
 mod settings_ui;
 mod theme;

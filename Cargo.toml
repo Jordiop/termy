@@ -59,6 +59,9 @@ notify = "9"
 # Clipboard
 arboard = "3.7"
 
+# Per-session CPU / RAM / disk I/O (processes only; no `network` feature)
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
+
 # Logging (local stderr only)
 log = "0.4"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }

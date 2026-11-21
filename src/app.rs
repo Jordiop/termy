@@ -28,6 +28,7 @@ use crate::settings_ui::{self, SettingsInput, SettingsOutput, SettingsState};
 use crate::config::{Action, AppConfig, ConfigFile, ConfigPaths, ConfigWatcher, Decorations, FontConfig, Reload, WatchEvent};
 use crate::input::{self, KeyModes, MouseButton, MouseEventKind, WheelAction};
 use crate::renderer::{CursorDraw, EguiFrame, PaneFrame, Renderer};
+use crate::resources::ResourceMonitor;
 use crate::session::{GridSnapshot, SessionId, SessionManager, SpawnRequest};
 use crate::theme::{Theme, ThemeRegistry};
 use crate::workspace::{PaneId, Rect, SplitDir, Workspace};
@@ -78,6 +79,7 @@ pub struct App {
     sessions: SessionManager,
     workspace: Workspace,
     monitor: AiMonitor,
+    resources: ResourceMonitor,
     _watcher: Option<ConfigWatcher>,
     gfx: Option<Gfx>,
     chrome: ChromeState,
@@ -126,6 +128,11 @@ impl App {
 
         Self {
             sessions: SessionManager::new(wake.clone(), Some(paths.archive_file.clone())),
+            resources: ResourceMonitor::start(
+                config.resources.active(config.window.pane_footer),
+                Duration::from_millis(config.resources.interval_ms),
+                wake.clone(),
+            ),
             monitor: AiMonitor::start(&config, wake),
             config_error: error.map(|e| e.to_string()),
             sidebar_visible: config.window.sidebar_visible,
@@ -310,6 +317,10 @@ impl App {
         self.theme = self.themes.resolve(&self.config.appearance.theme).clone();
         self.sessions.set_theme(&self.theme);
         self.sessions.apply_config(&self.config);
+        if old.resources != self.config.resources || old.window.pane_footer != self.config.window.pane_footer {
+            let r = &self.config.resources;
+            self.resources.configure(r.active(self.config.window.pane_footer), Duration::from_millis(r.interval_ms));
+        }
         if old.agents != self.config.agents || old.monitor != self.config.monitor {
             self.monitor_reconfigure_at = Some(Instant::now() + Duration::from_millis(800));
         }
@@ -778,6 +789,12 @@ impl App {
         }
         let mut summaries = self.sessions.summaries(now, timeout);
         let usage = self.usage_views(&summaries);
+        self.resources.set_roots(self.sessions.iter().filter_map(|s| Some((s.id, s.pid()?))).collect());
+        let resource_usage = if self.config.resources.active(self.config.window.pane_footer) {
+            self.resources.snapshot()
+        } else {
+            HashMap::new()
+        };
         // A shell where an agent was detected is named after the agent.
         for s in &mut summaries {
             if s.profile.is_none()
@@ -811,6 +828,8 @@ impl App {
             terminal_background: theme.colors.background,
             summaries: &summaries,
             usage: &usage,
+            resources: &resource_usage,
+            resource_display: &config.resources,
             archived: sessions.archived(),
             workspace,
             agents: &config.agents,

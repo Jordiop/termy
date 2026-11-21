@@ -12,7 +12,8 @@ use std::collections::HashMap;
 use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
 use crate::ai_monitor::{Gauge, format_reset, format_tokens};
-use crate::config::{AgentProfile, TabStyle};
+use crate::config::{AgentProfile, ResourcesConfig, TabStyle};
+use crate::resources::{ResourceUsage, format_bytes, format_cpu};
 use crate::session::{
     ActivityState, ArchivedSession, SessionFilter, SessionId, SessionSummary, filter_counts, format_elapsed, group_sessions,
 };
@@ -68,6 +69,9 @@ pub struct ChromeInput<'a> {
     pub terminal_background: Rgb,
     pub summaries: &'a [SessionSummary],
     pub usage: &'a HashMap<SessionId, UsageView>,
+    /// Per-tab CPU / RAM / disk (empty when disabled).
+    pub resources: &'a HashMap<SessionId, ResourceUsage>,
+    pub resource_display: &'a ResourcesConfig,
     pub archived: &'a [ArchivedSession],
     pub workspace: &'a Workspace,
     pub agents: &'a [AgentProfile],
@@ -647,6 +651,37 @@ fn footer(ui: &mut egui::Ui, rect: Rect, sid: SessionId, input: &ChromeInput<'_>
     } else if let Some(u) = usage.filter(|u| u.weekly_used > 0) {
         let r = p.text(Pos2::new(rect.right() - 10.0, y), Align2::RIGHT_CENTER, format!("{} this week", format_tokens(u.weekly_used)), font.clone(), c32(colors.text_dim));
         right_edge = r.left();
+    }
+
+    // Resource usage, small and dim, left of the budget.
+    if let Some(r) = input.resources.get(&sid) {
+        let cfg = input.resource_display;
+        let mut parts = Vec::new();
+        if cfg.show_cpu {
+            parts.push(format!("CPU {}", format_cpu(r.cpu_percent)));
+        }
+        if cfg.show_memory {
+            parts.push(format!("RAM {}", format_bytes(r.memory_bytes)));
+        }
+        if cfg.show_disk {
+            parts.push(format!("IO {}/s", format_bytes(r.disk_read_per_sec + r.disk_write_per_sec)));
+        }
+        if !parts.is_empty() {
+            let x = if right_edge < rect.right() { right_edge - 14.0 } else { rect.right() - 10.0 };
+            let small = FontId::proportional(10.5);
+            let text_rect = p.text(Pos2::new(x, y), Align2::RIGHT_CENTER, parts.join("  ·  "), small, c32(colors.text_dim));
+            right_edge = text_rect.left();
+            let hover = Rect::from_min_max(Pos2::new(text_rect.left(), rect.top()), Pos2::new(text_rect.right(), rect.bottom()));
+            ui.interact(hover, ui.scope_id().with(("resources", sid)), Sense::hover()).on_hover_text(format!(
+                "{} process{}\nCPU {} of one core\nRAM {}\nDisk read {}/s · write {}/s",
+                r.processes,
+                if r.processes == 1 { "" } else { "es" },
+                format_cpu(r.cpu_percent),
+                format_bytes(r.memory_bytes),
+                format_bytes(r.disk_read_per_sec),
+                format_bytes(r.disk_write_per_sec),
+            ));
+        }
     }
 
     // Left side: state · model · tokens.
