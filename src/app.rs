@@ -1010,6 +1010,10 @@ impl ApplicationHandler<UserEvent> for App {
                 self.on_cursor_moved(*position);
                 true
             }
+            // egui-winit answers `repaint: true` to RedrawRequested, which would
+            // request another redraw from every redraw: an endless loop at the
+            // display's refresh rate even when idle.
+            WindowEvent::RedrawRequested => false,
             _ => true,
         };
         if to_egui && let Some(g) = &mut self.gfx {
