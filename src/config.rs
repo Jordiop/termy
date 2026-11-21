@@ -200,7 +200,7 @@ pub struct ShellConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TerminalConfig {
-    /// `None` → OS default (`$SHELL`/zsh, pwsh/cmd).
+    /// `None` → OS default (`$SHELL`/zsh, pwsh/powershell/cmd).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<ShellConfig>,
     /// Directory for new sessions. `None` → home directory.
