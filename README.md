@@ -51,6 +51,9 @@ comments and formatting.
   `tokyo-night`, `gruvbox-dark`, `solarized-light`, or your own
   `~/.config/termy/themes/<name>.toml` (same format as `assets/themes/`)
 * `[monitor]` and `[[agents]]`: agent profiles and token budgets
+* `[resources]`: per-tab CPU / RAM / disk I/O in the pane footer (`enabled`,
+  `show_cpu`, `show_memory`, `show_disk`, `interval_ms`). It counts the tab's
+  whole process tree, so an agent's subprocesses are included.
 
 ```toml
 [[agents]]

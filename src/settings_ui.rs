@@ -256,6 +256,33 @@ fn appearance(ui: &mut egui::Ui, state: &mut SettingsState, input: &SettingsInpu
         });
         ui.end_row();
     });
+
+    section(ui, "Resource usage");
+    ui.label(
+        RichText::new("CPU, RAM and disk I/O of each tab's process tree, shown small in the pane footer.")
+            .size(11.0)
+            .color(c32(input.colors.text_dim)),
+    );
+    let footer_on = draft.window.pane_footer;
+    grid(ui, "appearance-resources", |ui| {
+        ui.label("Show");
+        ui.add_enabled(footer_on, egui::Checkbox::new(&mut draft.resources.enabled, "Resource usage in the footer"));
+        ui.end_row();
+        let on = footer_on && draft.resources.enabled;
+        ui.label("Metrics");
+        ui.horizontal(|ui| {
+            ui.add_enabled(on, egui::Checkbox::new(&mut draft.resources.show_cpu, "CPU"));
+            ui.add_enabled(on, egui::Checkbox::new(&mut draft.resources.show_memory, "RAM"));
+            ui.add_enabled(on, egui::Checkbox::new(&mut draft.resources.show_disk, "Disk I/O"));
+        });
+        ui.end_row();
+        ui.label("Refresh every");
+        ui.add_enabled(on, egui::Slider::new(&mut draft.resources.interval_ms, 500..=10_000).step_by(250.0).suffix(" ms"));
+        ui.end_row();
+    });
+    if !footer_on {
+        ui.label(RichText::new("Enable the pane footer above to show resource usage.").size(11.0).color(c32(input.colors.text_dim)));
+    }
 }
 
 /// Palette preview: background, a prompt line and the 8 ANSI swatches.

@@ -79,6 +79,7 @@ pub struct AppConfig {
     pub terminal: TerminalConfig,
     pub appearance: AppearanceConfig,
     pub monitor: MonitorConfig,
+    pub resources: ResourcesConfig,
     pub keybindings: Keybindings,
     /// `[[agents]]`: AI CLI profiles. Must stay last (array of tables).
     pub agents: Vec<AgentProfile>,
@@ -255,6 +256,31 @@ pub struct MonitorConfig {
 impl Default for MonitorConfig {
     fn default() -> Self {
         Self { enabled: true, scan_days: 8 }
+    }
+}
+
+/// `[resources]`: per-tab CPU / RAM / disk usage in the pane footer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ResourcesConfig {
+    pub enabled: bool,
+    pub show_cpu: bool,
+    pub show_memory: bool,
+    pub show_disk: bool,
+    /// How often the process table is sampled.
+    pub interval_ms: u64,
+}
+
+impl Default for ResourcesConfig {
+    fn default() -> Self {
+        Self { enabled: true, show_cpu: true, show_memory: true, show_disk: true, interval_ms: 2_000 }
+    }
+}
+
+impl ResourcesConfig {
+    /// Sampling is pointless if nothing would be shown.
+    pub fn active(&self, pane_footer: bool) -> bool {
+        pane_footer && self.enabled && (self.show_cpu || self.show_memory || self.show_disk)
     }
 }
 
@@ -929,6 +955,7 @@ mod tests {
         assert_eq!(config.cursor.shape, CursorShape::Beam);
         assert_eq!(config.appearance.theme, "tokyo-night");
         assert_eq!(config.terminal.scrollback, 10_000);
+        assert_eq!(config.resources, ResourcesConfig::default());
         // Override, untouched default, disabled.
         let sidebar = config.keybindings.combo(Action::ToggleSidebar).unwrap();
         assert!(sidebar.ctrl && sidebar.alt && sidebar.key == "s");
@@ -987,6 +1014,17 @@ mod tests {
 
         // And it survives a roundtrip.
         assert_eq!(AppConfig::parse(&config.to_toml().unwrap()).unwrap(), config);
+    }
+
+    #[test]
+    fn resources_section_parses_and_gates_sampling() {
+        let config = AppConfig::parse("[resources]\nshow_disk = false\ninterval_ms = 5000").unwrap();
+        assert!(config.resources.enabled && config.resources.show_cpu && !config.resources.show_disk);
+        assert_eq!(config.resources.interval_ms, 5000);
+        assert!(config.resources.active(true));
+        assert!(!config.resources.active(false), "no footer → nothing to show");
+        let hidden = ResourcesConfig { show_cpu: false, show_memory: false, show_disk: false, ..Default::default() };
+        assert!(!hidden.active(true));
     }
 
     #[test]
