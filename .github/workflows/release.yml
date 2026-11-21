@@ -38,7 +38,7 @@ jobs:
     outputs:
       version: ${{ steps.next.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # tags
 
@@ -61,7 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install fonts
         run: sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends fonts-dejavu-core
       - uses: dtolnay/rust-toolchain@stable
@@ -74,12 +74,12 @@ jobs:
   macos:
     name: macOS .dmg
     needs: [version, test]
-    runs-on: macos-14
+    runs-on: macos-latest # Apple Silicon
     timeout-minutes: 45
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Stamp the release version into Cargo.toml so the binary, Info.plist
@@ -87,7 +87,7 @@ jobs:
       - name: Set version ${{ env.VERSION }}
         run: sed -i '' "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
       - run: scripts/bundle-macos.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: termy-macos
           path: dist/*.dmg
@@ -111,7 +111,7 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Set version ${{ env.VERSION }}
@@ -133,7 +133,7 @@ jobs:
             cp target/release/termy README.md "dist/termy-${VERSION}/"
             tar -C dist -czf "dist/termy-${VERSION}-linux-x86_64.tar.gz" "termy-${VERSION}"
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: termy-${{ runner.os }}
           path: |
@@ -151,11 +151,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ needs.version.outputs.version }}
           name: termy v${{ needs.version.outputs.version }}
