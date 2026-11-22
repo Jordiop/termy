@@ -28,8 +28,11 @@ use crate::settings_ui::{self, SettingsInput, SettingsOutput, SettingsState};
 use crate::config::{Action, AppConfig, ConfigFile, ConfigPaths, ConfigWatcher, Decorations, FontConfig, Reload, WatchEvent};
 use crate::input::{self, KeyModes, MouseButton, MouseEventKind, WheelAction};
 use crate::renderer::{CursorDraw, EguiFrame, PaneFrame, Renderer};
-use crate::session::{GridSnapshot, SessionId, SessionManager, SpawnRequest};
+use crate::resources::ResourceMonitor;
+use crate::session::{GridSnapshot, SessionId, SessionManager, SpawnRequest, USAGE_TAB};
+use crate::stats_ui::{self, StatsInput, StatsState};
 use crate::theme::{Theme, ThemeRegistry};
+use crate::usage_stats::UsageStats;
 use crate::workspace::{PaneId, Rect, SplitDir, Workspace};
 
 #[derive(Debug, Clone, Copy)]
@@ -78,10 +81,16 @@ pub struct App {
     sessions: SessionManager,
     workspace: Workspace,
     monitor: AiMonitor,
+    resources: ResourceMonitor,
     _watcher: Option<ConfigWatcher>,
     gfx: Option<Gfx>,
     chrome: ChromeState,
     settings: SettingsState,
+    /// Usage dashboard tab: view state, and its last computed stats keyed by
+    /// (store generation, view state, minute).
+    stats: StatsState,
+    usage_cache: Option<((u64, StatsState, u64), Arc<UsageStats>)>,
+    local_tz: jiff::tz::TimeZone,
     /// Installed monospace fonts (computed on first settings open).
     font_families: Option<Vec<String>>,
     /// Debounced AI monitor reconfiguration (typing a log path rescans).
@@ -126,6 +135,11 @@ impl App {
 
         Self {
             sessions: SessionManager::new(wake.clone(), Some(paths.archive_file.clone())),
+            resources: ResourceMonitor::start(
+                config.resources.active(config.window.pane_footer),
+                Duration::from_millis(config.resources.interval_ms),
+                wake.clone(),
+            ),
             monitor: AiMonitor::start(&config, wake),
             config_error: error.map(|e| e.to_string()),
             sidebar_visible: config.window.sidebar_visible,
@@ -138,6 +152,9 @@ impl App {
             gfx: None,
             chrome: ChromeState::default(),
             settings: SettingsState::default(),
+            stats: StatsState::default(),
+            usage_cache: None,
+            local_tz: jiff::tz::TimeZone::system(),
             font_families: None,
             monitor_reconfigure_at: None,
             font_delta: 0.0,
@@ -178,7 +195,9 @@ impl App {
 
     fn restyle(&mut self) {
         if let Some(g) = &self.gfx {
-            chrome::apply_style(&g.egui_ctx, &self.theme.ui(), self.theme.is_light(), g.renderer.font_bytes());
+            let ui = self.theme.ui();
+            chrome::apply_style(&g.egui_ctx, &ui, self.theme.is_light(), g.renderer.font_bytes());
+            style_title_bar(&g.window, &ui, self.theme.is_light());
         }
     }
 
@@ -205,6 +224,14 @@ impl App {
             .with_min_inner_size(LogicalSize::new(480.0, 320.0))
             .with_transparent(transparent)
             .with_decorations(w.decorations != Decorations::None);
+        // macOS takes the icon from the .app bundle; elsewhere the window sets it.
+        #[cfg(not(target_os = "macos"))]
+        let attrs = attrs.with_window_icon(window_icon());
+        #[cfg(target_os = "windows")]
+        let attrs = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs.with_taskbar_icon(window_icon())
+        };
         #[cfg(target_os = "macos")]
         let attrs = if w.decorations == Decorations::Transparent {
             use winit::platform::macos::WindowAttributesExtMacOS;
@@ -271,8 +298,41 @@ impl App {
 
     fn close_session(&mut self, id: SessionId) {
         self.workspace.remove_session(id);
-        self.sessions.close(id);
+        if id != USAGE_TAB {
+            self.sessions.close(id);
+        }
         self.request_redraw();
+    }
+
+    /// Focuses the usage dashboard tab, opening it in the focused pane.
+    fn open_usage(&mut self) {
+        if !self.workspace.focus_session(USAGE_TAB) {
+            self.workspace.add_session(USAGE_TAB);
+        }
+        self.monitor.load_history(self.stats.range.history_needed());
+        self.request_redraw();
+    }
+
+    /// Stats for the dashboard when its tab is on screen. Recomputed only
+    /// when the usage data, the view or the minute changes.
+    fn usage_stats(&mut self) -> Option<Arc<UsageStats>> {
+        if !self.workspace.visible_sessions().contains(&USAGE_TAB) {
+            return None;
+        }
+        let now = now_ms();
+        let store = self.monitor.store().read();
+        let key = (store.generation(), self.stats.clone(), now / 60_000);
+        if let Some((k, stats)) = &self.usage_cache
+            && *k == key
+        {
+            return Some(stats.clone());
+        }
+        let tz = &self.local_tz;
+        let offset = |ms: u64| jiff::Timestamp::from_millisecond(ms as i64).map_or(0, |t| tz.to_offset(t).seconds() as i64);
+        let stats = Arc::new(UsageStats::compute(&store, self.stats.range, self.stats.agent.as_deref(), now, offset));
+        drop(store);
+        self.usage_cache = Some((key, stats.clone()));
+        Some(stats)
     }
 
     fn focused(&self) -> Option<&crate::session::Session> {
@@ -310,6 +370,10 @@ impl App {
         self.theme = self.themes.resolve(&self.config.appearance.theme).clone();
         self.sessions.set_theme(&self.theme);
         self.sessions.apply_config(&self.config);
+        if old.resources != self.config.resources || old.window.pane_footer != self.config.window.pane_footer {
+            let r = &self.config.resources;
+            self.resources.configure(r.active(self.config.window.pane_footer), Duration::from_millis(r.interval_ms));
+        }
         if old.agents != self.config.agents || old.monitor != self.config.monitor {
             self.monitor_reconfigure_at = Some(Instant::now() + Duration::from_millis(800));
         }
@@ -384,6 +448,7 @@ impl App {
             }
             // Milestone 4: settings panel.
             Action::ToggleSettings => self.toggle_settings(),
+            Action::OpenUsage => self.open_usage(),
             Action::IncreaseFont => self.set_font_delta(self.font_delta + 1.0),
             Action::DecreaseFont => self.set_font_delta(self.font_delta - 1.0),
             Action::ResetFont => self.set_font_delta(0.0),
@@ -420,6 +485,7 @@ impl App {
                     self.toggle_settings();
                 }
             }
+            UiAction::OpenUsage => self.open_usage(),
             UiAction::RestoreArchived(index) => {
                 let (cols, rows) = self.focused().map(|s| s.size()).unwrap_or((self.config.window.columns, self.config.window.rows));
                 match self.sessions.restore(index, &self.config, &self.theme, cols, rows) {
@@ -642,7 +708,7 @@ impl App {
         }
         let Some(hit) = self.hit(x, y) else { return false };
         self.workspace.focus_pane(hit.pane);
-        let Some(id) = hit.session else { return true };
+        let Some(id) = hit.session.filter(|id| *id != USAGE_TAB) else { return true };
         let (row, col, side) = self.grid_point(&hit, x, y);
         if let Some(s) = self.sessions.get(id) {
             s.clear_attention();
@@ -719,6 +785,9 @@ impl App {
         let (x, y) = (self.mouse.pos.x, self.mouse.pos.y);
         let Some(hit) = self.hit(x, y) else { return false };
         let Some(id) = hit.session else { return true };
+        if id == USAGE_TAB {
+            return false; // the dashboard scrolls itself
+        }
         let cell_h = self.gfx.as_ref().map(|g| g.renderer.cell_metrics().height as f64).unwrap_or(16.0);
         let lines = match delta {
             MouseScrollDelta::LineDelta(_, dy) => dy as f64 * self.config.terminal.scroll_multiplier,
@@ -778,6 +847,12 @@ impl App {
         }
         let mut summaries = self.sessions.summaries(now, timeout);
         let usage = self.usage_views(&summaries);
+        self.resources.set_roots(self.sessions.iter().filter_map(|s| Some((s.id, s.pid()?))).collect());
+        let resource_usage = if self.config.resources.active(self.config.window.pane_footer) {
+            self.resources.snapshot()
+        } else {
+            HashMap::new()
+        };
         // A shell where an agent was detected is named after the agent.
         for s in &mut summaries {
             if s.profile.is_none()
@@ -789,6 +864,9 @@ impl App {
         }
         let weekly_usage = if self.settings.open { self.weekly_usage() } else { HashMap::new() };
         let mut settings_out = SettingsOutput::default();
+        let usage_stats = self.usage_stats();
+        let usage_loading = usage_stats.is_some() && self.monitor.store().read().is_loading();
+        let stats_before = self.stats.clone();
 
         // OSC 52 copies requested by apps.
         let mut copies = Vec::new();
@@ -802,7 +880,7 @@ impl App {
             }
         }
 
-        let Self { gfx, chrome, sessions, workspace, config, theme, themes, config_error, sidebar_visible, settings, font_families, .. } = self;
+        let Self { gfx, chrome, sessions, workspace, config, theme, themes, config_error, sidebar_visible, settings, font_families, stats, .. } = self;
         let Some(g) = gfx.as_mut() else { return };
         let scrolled: Vec<SessionId> = workspace.visible_sessions().into_iter().filter(|id| sessions.get(*id).is_some_and(|s| s.is_scrolled())).collect();
         let ui_colors = theme.ui();
@@ -811,6 +889,8 @@ impl App {
             terminal_background: theme.colors.background,
             summaries: &summaries,
             usage: &usage,
+            resources: &resource_usage,
+            resource_display: &config.resources,
             archived: sessions.archived(),
             workspace,
             agents: &config.agents,
@@ -836,6 +916,19 @@ impl App {
         let mut out = ChromeOutput::default();
         let full = g.egui_ctx.run_ui(raw, |ui| {
             out = chrome::draw(ui, chrome, &input);
+            if let Some(usage) = &usage_stats {
+                let stats_input = StatsInput {
+                    colors: &ui_colors,
+                    background: theme.colors.background,
+                    stats: usage,
+                    agents: &config.agents,
+                    loading: usage_loading,
+                    monitor_enabled: config.monitor.enabled,
+                };
+                for view in out.panes.iter().filter(|v| v.session == Some(USAGE_TAB)) {
+                    stats_ui::draw(ui, view.terminal, stats, &stats_input);
+                }
+            }
             if settings.open {
                 settings_out = settings_ui::show(ui.ctx(), settings, &settings_input);
             }
@@ -904,6 +997,13 @@ impl App {
         for action in out.actions {
             self.apply_ui_action(action);
         }
+        if self.stats != stats_before {
+            // This frame drew stats for the old view; show the new one.
+            if self.stats.range != stats_before.range {
+                self.monitor.load_history(self.stats.range.history_needed());
+            }
+            self.request_redraw();
+        }
         if self.settings.open || settings_out.close {
             self.handle_settings(settings_out);
         }
@@ -913,7 +1013,7 @@ impl App {
     fn next_deadline(&self) -> Option<Instant> {
         let mut next: Option<Instant> = self.egui_repaint_at.or(self.capture.as_ref().map(|(t, _)| *t)).or(self.monitor_reconfigure_at);
         let mut consider = |t: Instant| next = Some(next.map_or(t, |n| n.min(t)));
-        if self.config.cursor.blink && self.window_focused && self.workspace.focused_session().is_some() {
+        if self.config.cursor.blink && self.window_focused && self.focused().is_some() {
             let interval = self.config.cursor.blink_interval_ms.max(100);
             let elapsed = self.blink_epoch.elapsed().as_millis() as u64;
             consider(self.blink_epoch + Duration::from_millis((elapsed / interval + 1) * interval));
@@ -991,6 +1091,10 @@ impl ApplicationHandler<UserEvent> for App {
                 self.on_cursor_moved(*position);
                 true
             }
+            // egui-winit answers `repaint: true` to RedrawRequested, which would
+            // request another redraw from every redraw: an endless loop at the
+            // display's refresh rate even when idle.
+            WindowEvent::RedrawRequested => false,
             _ => true,
         };
         if to_egui && let Some(g) = &mut self.gfx {
@@ -1030,5 +1134,47 @@ impl ApplicationHandler<UserEvent> for App {
             Some(t) => ControlFlow::WaitUntil(t),
             None => ControlFlow::Wait,
         });
+    }
+}
+
+/// Makes the native title bar (when there is one) follow the theme. Every OS
+/// gets light/dark: GTK and Wayland decorations and macOS's native bar honour
+/// it. Windows 11 also takes exact colors: the chrome background, text and
+/// border (older Windows ignores them and keeps the light/dark hint).
+fn style_title_bar(window: &Window, ui: &crate::theme::UiColors, light: bool) {
+    window.set_theme(Some(if light { winit::window::Theme::Light } else { winit::window::Theme::Dark }));
+    #[cfg(target_os = "windows")]
+    {
+        use winit::platform::windows::{Color, WindowExtWindows};
+        let c = |c: crate::theme::Rgb| Color::from_rgb(c.r, c.g, c.b);
+        window.set_title_background_color(Some(c(ui.chrome_background)));
+        window.set_title_text_color(c(ui.text_primary));
+        window.set_border_color(Some(c(ui.border)));
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = ui;
+}
+
+/// The app icon for the title bar, taskbar and Alt+Tab (Windows / Linux).
+#[cfg(not(target_os = "macos"))]
+fn window_icon() -> Option<winit::window::Icon> {
+    const PNG: &[u8] = include_bytes!("../assets/windows/icon-256.png");
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(PNG));
+    decoder.set_transformations(png::Transformations::normalize_to_color8() | png::Transformations::ALPHA);
+    let mut reader = decoder.read_info().ok()?;
+    let mut rgba = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut rgba).ok()?;
+    if info.color_type != png::ColorType::Rgba {
+        return None;
+    }
+    rgba.truncate(info.buffer_size());
+    winit::window::Icon::from_rgba(rgba, info.width, info.height).ok()
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod icon_tests {
+    #[test]
+    fn window_icon_decodes() {
+        assert!(super::window_icon().is_some());
     }
 }

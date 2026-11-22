@@ -36,8 +36,12 @@ pub struct ExitInfo {
 /// `(program, args)` of the platform's default interactive shell.
 pub fn default_shell() -> (String, Vec<String>) {
     if cfg!(windows) {
-        if find_in_path("pwsh.exe").is_some() {
-            return ("pwsh.exe".into(), vec!["-NoLogo".into()]);
+        // PowerShell 7 if installed, else the Windows PowerShell 5.1 that ships
+        // with every Windows; cmd only as a last resort.
+        for ps in ["pwsh.exe", "powershell.exe"] {
+            if find_in_path(ps).is_some() {
+                return (ps.into(), vec!["-NoLogo".into()]);
+            }
         }
         let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
         return (comspec, Vec::new());
@@ -64,7 +68,6 @@ pub struct PtyHandle {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer_tx: Sender<Vec<u8>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
-    #[cfg_attr(not(test), allow(dead_code))]
     pid: Option<u32>,
 }
 
@@ -165,7 +168,6 @@ impl PtyHandle {
         }
     }
 
-    #[cfg(test)]
     pub fn pid(&self) -> Option<u32> {
         self.pid
     }

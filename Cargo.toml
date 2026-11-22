@@ -1,6 +1,6 @@
 [package]
 name = "termy"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # egui / egui-wgpu / egui-winit 0.37 and parking_lot 0.13 require Rust 1.95.
 rust-version = "1.95"
@@ -59,12 +59,26 @@ notify = "9"
 # Clipboard
 arboard = "3.7"
 
+# Per-session CPU / RAM / disk I/O (processes only; no `network` feature)
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
+
+# Local time zone for the usage dashboard (days, hour-of-week heatmap).
+# Reads the OS zone database, with a bundled copy as fallback (Windows has none).
+jiff = { version = "1", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo", "tzdb-bundle-always"] }
+
+# Window icon on Windows / Linux (decodes assets/windows/icon-256.png).
+png = "0.18"
+
 # Logging (local stderr only)
 log = "0.4"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[build-dependencies]
+# Windows: links assets/windows/termy.ico into the .exe (see build.rs).
+embed-resource = "3"
 
 [profile.release]
 lto = "thin"

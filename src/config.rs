@@ -79,6 +79,7 @@ pub struct AppConfig {
     pub terminal: TerminalConfig,
     pub appearance: AppearanceConfig,
     pub monitor: MonitorConfig,
+    pub resources: ResourcesConfig,
     pub keybindings: Keybindings,
     /// `[[agents]]`: AI CLI profiles. Must stay last (array of tables).
     pub agents: Vec<AgentProfile>,
@@ -200,7 +201,7 @@ pub struct ShellConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TerminalConfig {
-    /// `None` → OS default (`$SHELL`/zsh, pwsh/cmd).
+    /// `None` → OS default (`$SHELL`/zsh, pwsh/powershell/cmd).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<ShellConfig>,
     /// Directory for new sessions. `None` → home directory.
@@ -255,6 +256,31 @@ pub struct MonitorConfig {
 impl Default for MonitorConfig {
     fn default() -> Self {
         Self { enabled: true, scan_days: 8 }
+    }
+}
+
+/// `[resources]`: per-tab CPU / RAM / disk usage in the pane footer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ResourcesConfig {
+    pub enabled: bool,
+    pub show_cpu: bool,
+    pub show_memory: bool,
+    pub show_disk: bool,
+    /// How often the process table is sampled.
+    pub interval_ms: u64,
+}
+
+impl Default for ResourcesConfig {
+    fn default() -> Self {
+        Self { enabled: true, show_cpu: true, show_memory: true, show_disk: true, interval_ms: 2_000 }
+    }
+}
+
+impl ResourcesConfig {
+    /// Sampling is pointless if nothing would be shown.
+    pub fn active(&self, pane_footer: bool) -> bool {
+        pane_footer && self.enabled && (self.show_cpu || self.show_memory || self.show_disk)
     }
 }
 
@@ -408,6 +434,7 @@ pub enum Action {
     ToggleSidebar,
     SearchSessions,
     ToggleSettings,
+    OpenUsage,
     IncreaseFont,
     DecreaseFont,
     ResetFont,
@@ -415,7 +442,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 16] = [
+    pub const ALL: [Action; 17] = [
         Action::Copy,
         Action::Paste,
         Action::NewSession,
@@ -428,6 +455,7 @@ impl Action {
         Action::ToggleSidebar,
         Action::SearchSessions,
         Action::ToggleSettings,
+        Action::OpenUsage,
         Action::IncreaseFont,
         Action::DecreaseFont,
         Action::ResetFont,
@@ -448,6 +476,7 @@ impl Action {
             Action::ToggleSidebar => "Toggle sidebar",
             Action::SearchSessions => "Search sessions",
             Action::ToggleSettings => "Settings",
+            Action::OpenUsage => "Usage dashboard",
             Action::IncreaseFont => "Increase font size",
             Action::DecreaseFont => "Decrease font size",
             Action::ResetFont => "Reset font size",
@@ -472,6 +501,7 @@ impl Action {
             Action::ToggleSidebar => if mac { "cmd+b" } else { "ctrl+shift+b" },
             Action::SearchSessions => if mac { "cmd+k" } else { "ctrl+shift+k" },
             Action::ToggleSettings => if mac { "cmd+comma" } else { "ctrl+comma" },
+            Action::OpenUsage => if mac { "cmd+shift+u" } else { "ctrl+shift+u" },
             Action::IncreaseFont => if mac { "cmd+equal" } else { "ctrl+equal" },
             Action::DecreaseFont => if mac { "cmd+minus" } else { "ctrl+minus" },
             Action::ResetFont => if mac { "cmd+0" } else { "ctrl+0" },
@@ -929,6 +959,7 @@ mod tests {
         assert_eq!(config.cursor.shape, CursorShape::Beam);
         assert_eq!(config.appearance.theme, "tokyo-night");
         assert_eq!(config.terminal.scrollback, 10_000);
+        assert_eq!(config.resources, ResourcesConfig::default());
         // Override, untouched default, disabled.
         let sidebar = config.keybindings.combo(Action::ToggleSidebar).unwrap();
         assert!(sidebar.ctrl && sidebar.alt && sidebar.key == "s");
@@ -987,6 +1018,17 @@ mod tests {
 
         // And it survives a roundtrip.
         assert_eq!(AppConfig::parse(&config.to_toml().unwrap()).unwrap(), config);
+    }
+
+    #[test]
+    fn resources_section_parses_and_gates_sampling() {
+        let config = AppConfig::parse("[resources]\nshow_disk = false\ninterval_ms = 5000").unwrap();
+        assert!(config.resources.enabled && config.resources.show_cpu && !config.resources.show_disk);
+        assert_eq!(config.resources.interval_ms, 5000);
+        assert!(config.resources.active(true));
+        assert!(!config.resources.active(false), "no footer → nothing to show");
+        let hidden = ResourcesConfig { show_cpu: false, show_memory: false, show_disk: false, ..Default::default() };
+        assert!(!hidden.active(true));
     }
 
     #[test]

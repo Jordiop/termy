@@ -27,6 +27,7 @@ cargo run --release
 | Toggle sidebar | ⌘B | Ctrl+Shift+B |
 | Search sessions | ⌘K | Ctrl+Shift+K |
 | Settings | ⌘, | Ctrl+, |
+| Usage dashboard | ⇧⌘U | Ctrl+Shift+U |
 | Copy / paste | ⌘C / ⌘V | Ctrl+Shift+C / Ctrl+Shift+V |
 | Font size + / − / reset | ⌘= / ⌘- / ⌘0 | Ctrl+= / Ctrl+- / Ctrl+0 |
 | Reload config | ⇧⌘R | Ctrl+Shift+R |
@@ -51,6 +52,9 @@ comments and formatting.
   `tokyo-night`, `gruvbox-dark`, `solarized-light`, or your own
   `~/.config/termy/themes/<name>.toml` (same format as `assets/themes/`)
 * `[monitor]` and `[[agents]]`: agent profiles and token budgets
+* `[resources]`: per-tab CPU / RAM / disk I/O in the pane footer (`enabled`,
+  `show_cpu`, `show_memory`, `show_disk`, `interval_ms`). It counts the tab's
+  whole process tree, so an agent's subprocesses are included.
 
 ```toml
 [[agents]]
@@ -66,6 +70,16 @@ Metrics sources: `claude_code`, `codex`, `gemini_cli`, `jsonl` (any log, with
 fields mapped via JSON pointers) and `command` (a local program that prints
 `{"used": N, "limit": N, "resets_at": "…"}`).
 
+### Usage dashboard
+
+Ctrl+Shift+U (⇧⌘U), or the chart button next to Settings, opens a **Usage**
+tab with tokens, tasks and agent time over 7 / 30 / 90 days or all history,
+tokens by day, an hour-of-week heatmap, and per-model and per-agent tables
+(click an agent to see only its usage). A *task* is one agent session and a
+*turn* one model call; agent time merges each session's calls into active
+spans (gaps over 5 min end a span). Older logs are read on demand the first
+time a longer range is picked.
+
 ## Privacy
 
 The token monitor only reads files the agents already write on your machine.
@@ -74,7 +88,7 @@ termy never opens a network connection.
 ## Development
 
 ```sh
-cargo test     # 76 tests: config, themes, PTY, VT emulation, token parsing, layout, input
+cargo test     # 84 tests: config, themes, PTY, VT emulation, token parsing, usage stats, layout, input
 cargo clippy --all-targets
 ```
 

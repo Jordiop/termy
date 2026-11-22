@@ -33,6 +33,10 @@ use crate::theme::{Rgb, Theme};
 
 pub type SessionId = u64;
 
+/// Tab id of the usage dashboard: a workspace tab with no terminal behind it.
+/// Never handed out by [`SessionManager`], so `get(USAGE_TAB)` is always `None`.
+pub const USAGE_TAB: SessionId = SessionId::MAX;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ActivityState {
     /// Produced output within the activity timeout.
@@ -703,6 +707,11 @@ impl Session {
 
     pub fn clear_attention(&self) {
         self.shared.attention.store(false, Ordering::Release);
+    }
+
+    /// PID of the process running in the PTY (root of the session's tree).
+    pub fn pid(&self) -> Option<u32> {
+        self.pty.pid()
     }
 
     /// Text an app asked to put on the clipboard (OSC 52).

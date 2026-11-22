@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use egui::{Color32, CornerRadius, RichText, Stroke, StrokeKind, Vec2};
+use egui::{Color32, CornerRadius, Rect, RichText, Stroke, StrokeKind, Vec2};
 
 use crate::ai_monitor::{WeeklyReset, format_tokens};
 use crate::chrome::{c32, paint_icon};
@@ -125,7 +125,7 @@ pub fn show(ctx: &egui::Context, state: &mut SettingsState, input: &SettingsInpu
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Settings").size(16.0).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("✕").on_hover_text("Close (Esc)").clicked() {
+                    if icon_button(ui, "close", 26.0, colors).on_hover_text("Close (Esc)").clicked() {
                         out.close = true;
                     }
                 });
@@ -136,10 +136,19 @@ pub fn show(ctx: &egui::Context, state: &mut SettingsState, input: &SettingsInpu
                 let top_down = egui::Layout::top_down(egui::Align::Min);
                 ui.allocate_ui_with_layout(Vec2::new(170.0, body_h), top_down, |ui| {
                     ui.set_width(170.0);
+                    ui.spacing_mut().item_spacing.y = 2.0;
                     for tab in SettingsTab::ALL {
                         let selected = state.tab == tab;
-                        let text = RichText::new(tab.label()).size(12.5).color(if selected { c32(colors.text_primary) } else { c32(colors.text_dim) });
-                        if ui.add_sized([170.0, 28.0], egui::Button::selectable(selected, text)).clicked() {
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(170.0, 30.0), egui::Sense::click());
+                        let p = ui.painter();
+                        if selected {
+                            p.rect_filled(rect, CornerRadius::same(6), c32(colors.pill_selected_background));
+                        } else if resp.hovered() {
+                            p.rect_filled(rect, CornerRadius::same(6), c32(colors.button_background));
+                        }
+                        let color = if selected { colors.text_primary } else { colors.text_dim };
+                        p.text(egui::pos2(rect.left() + 12.0, rect.center().y), egui::Align2::LEFT_CENTER, tab.label(), egui::FontId::proportional(12.5), c32(color));
+                        if resp.clicked() {
                             state.tab = tab;
                             state.recording = None;
                         }
@@ -153,7 +162,7 @@ pub fn show(ctx: &egui::Context, state: &mut SettingsState, input: &SettingsInpu
                         match state.tab {
                             SettingsTab::Appearance => appearance(ui, state, input),
                             SettingsTab::Typography => typography(ui, state, input),
-                            SettingsTab::Terminal => terminal(ui, state),
+                            SettingsTab::Terminal => terminal(ui, state, colors),
                             SettingsTab::Agents => agents(ui, state, input),
                             SettingsTab::Keybindings => keybindings(ui, state, colors),
                         }
@@ -192,6 +201,23 @@ pub fn show(ctx: &egui::Context, state: &mut SettingsState, input: &SettingsInpu
 // ---------------------------------------------------------------------------
 // Tabs
 // ---------------------------------------------------------------------------
+
+/// A small button placed at `rect` without advancing the layout.
+fn button_at(ui: &mut egui::Ui, rect: Rect, label: &str, enabled: bool) -> bool {
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+    child.add_enabled(enabled, egui::Button::new(RichText::new(label).size(11.5)).small().min_size(rect.size())).clicked()
+}
+
+/// A square icon button (hover background, drawn icon).
+fn icon_button(ui: &mut egui::Ui, icon: &str, size: f32, colors: &UiColors) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, CornerRadius::same(6), c32(colors.button_background));
+    }
+    let color = if resp.hovered() { colors.text_primary } else { colors.text_dim };
+    paint_icon(ui.painter(), rect.center(), size * 0.3, icon, c32(color));
+    resp
+}
 
 fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(6.0);
@@ -256,6 +282,33 @@ fn appearance(ui: &mut egui::Ui, state: &mut SettingsState, input: &SettingsInpu
         });
         ui.end_row();
     });
+
+    section(ui, "Resource usage");
+    ui.label(
+        RichText::new("CPU, RAM and disk I/O of each tab's process tree, shown small in the pane footer.")
+            .size(11.0)
+            .color(c32(input.colors.text_dim)),
+    );
+    let footer_on = draft.window.pane_footer;
+    grid(ui, "appearance-resources", |ui| {
+        ui.label("Show");
+        ui.add_enabled(footer_on, egui::Checkbox::new(&mut draft.resources.enabled, "Resource usage in the footer"));
+        ui.end_row();
+        let on = footer_on && draft.resources.enabled;
+        ui.label("Metrics");
+        ui.horizontal(|ui| {
+            ui.add_enabled(on, egui::Checkbox::new(&mut draft.resources.show_cpu, "CPU"));
+            ui.add_enabled(on, egui::Checkbox::new(&mut draft.resources.show_memory, "RAM"));
+            ui.add_enabled(on, egui::Checkbox::new(&mut draft.resources.show_disk, "Disk I/O"));
+        });
+        ui.end_row();
+        ui.label("Refresh every");
+        ui.add_enabled(on, egui::Slider::new(&mut draft.resources.interval_ms, 500..=10_000).step_by(250.0).suffix(" ms"));
+        ui.end_row();
+    });
+    if !footer_on {
+        ui.label(RichText::new("Enable the pane footer above to show resource usage.").size(11.0).color(c32(input.colors.text_dim)));
+    }
 }
 
 /// Palette preview: background, a prompt line and the 8 ANSI swatches.
@@ -334,7 +387,7 @@ fn typography(ui: &mut egui::Ui, state: &mut SettingsState, input: &SettingsInpu
     });
 }
 
-fn terminal(ui: &mut egui::Ui, state: &mut SettingsState) {
+fn terminal(ui: &mut egui::Ui, state: &mut SettingsState, colors: &UiColors) {
     let SettingsState { draft, shell_args, .. } = state;
     section(ui, "Shell");
     grid(ui, "terminal-shell", |ui| {
@@ -391,7 +444,7 @@ fn terminal(ui: &mut egui::Ui, state: &mut SettingsState) {
             changed |= ui.add(egui::TextEdit::singleline(key).desired_width(140.0)).changed();
             ui.label("=");
             changed |= ui.add(egui::TextEdit::singleline(value).desired_width(220.0)).changed();
-            if ui.small_button("✕").clicked() {
+            if icon_button(ui, "close", 20.0, colors).on_hover_text("Remove").clicked() {
                 remove = Some(i);
             }
         });
@@ -649,35 +702,60 @@ fn keybindings(ui: &mut egui::Ui, state: &mut SettingsState, colors: &UiColors) 
             *counts.entry(combo).or_default() += 1;
         }
     }
-    egui::Grid::new("keybindings").num_columns(3).spacing([16.0, 6.0]).show(ui, |ui| {
-        for action in Action::ALL {
-            ui.label(action.label());
-            let combo = state.draft.keybindings.combo(action);
-            let recording = state.recording == Some(action);
-            let text = if recording {
-                RichText::new("Press keys…").color(c32(colors.status_waiting))
-            } else {
-                match &combo {
-                    Some(c) if counts.get(c).copied().unwrap_or(0) > 1 => RichText::new(format!("{}  ⚠ duplicate", c.display())).color(c32(colors.status_waiting)),
-                    Some(c) => RichText::new(c.display()).monospace(),
-                    None => RichText::new("—").color(c32(colors.text_dim)),
-                }
-            };
-            if ui.add_sized([180.0, 24.0], egui::Button::selectable(recording, text)).clicked() {
-                state.recording = if recording { None } else { Some(action) };
-            }
-            ui.horizontal(|ui| {
-                let is_default = state.draft.keybindings.0.get(&action) == defaults.0.get(&action);
-                if ui.add_enabled(!is_default, egui::Button::new("Reset").small()).clicked() {
-                    state.draft.keybindings.0.insert(action, defaults.0[&action].clone());
-                }
-                if ui.add_enabled(combo.is_some(), egui::Button::new("Clear").small()).clicked() {
-                    state.draft.keybindings.0.insert(action, String::new());
-                }
-            });
-            ui.end_row();
+    // One full-width row per action: name · shortcut keycap · Reset / Clear.
+    let row_w = ui.available_width();
+    let name_w = (row_w * 0.38).clamp(140.0, 220.0);
+    let key_w = 200.0;
+    let action_w = 52.0;
+    ui.spacing_mut().item_spacing.y = 0.0;
+    for action in Action::ALL {
+        let (row, row_resp) = ui.allocate_exact_size(Vec2::new(row_w, 32.0), egui::Sense::hover());
+        let p = ui.painter();
+        if row_resp.hovered() {
+            p.rect_filled(row, CornerRadius::same(6), c32(colors.button_background).gamma_multiply(0.5));
         }
-    });
+        let y = row.center().y;
+        p.text(egui::pos2(row.left() + 8.0, y), egui::Align2::LEFT_CENTER, action.label(), egui::FontId::proportional(12.5), c32(colors.text_primary));
+
+        // Shortcut keycap, left-aligned in its own column.
+        let combo = state.draft.keybindings.combo(action);
+        let recording = state.recording == Some(action);
+        let duplicate = combo.as_ref().is_some_and(|c| counts.get(c).copied().unwrap_or(0) > 1);
+        let key = Rect::from_min_size(egui::pos2(row.left() + name_w, y - 12.0), Vec2::new(key_w, 24.0));
+        let key_resp = ui.interact(key, ui.scope_id().with(("keycap", action)), egui::Sense::click());
+        let (fill, stroke) = if recording {
+            (colors.pill_selected_background, colors.status_waiting)
+        } else if key_resp.hovered() {
+            (colors.pill_selected_background, colors.border)
+        } else {
+            (colors.input_background, colors.border)
+        };
+        let p = ui.painter();
+        p.rect(key, CornerRadius::same(5), c32(fill), Stroke::new(1.0, c32(stroke)), StrokeKind::Inside);
+        let (text, color) = match &combo {
+            _ if recording => ("Press keys…".to_owned(), colors.status_waiting),
+            Some(c) => (c.display(), if duplicate { colors.status_waiting } else { colors.text_primary }),
+            None => ("—".to_owned(), colors.text_dim),
+        };
+        p.text(egui::pos2(key.left() + 10.0, y), egui::Align2::LEFT_CENTER, text, egui::FontId::monospace(12.0), c32(color));
+        if duplicate && !recording {
+            p.text(egui::pos2(key.right() + 10.0, y), egui::Align2::LEFT_CENTER, "duplicate", egui::FontId::proportional(11.0), c32(colors.status_waiting));
+        }
+        if key_resp.on_hover_text("Click, then press the new combination").clicked() {
+            state.recording = if recording { None } else { Some(action) };
+        }
+
+        // Reset / Clear, right-aligned.
+        let is_default = state.draft.keybindings.0.get(&action) == defaults.0.get(&action);
+        let clear = Rect::from_min_size(egui::pos2(row.right() - action_w - 4.0, y - 11.0), Vec2::new(action_w, 22.0));
+        let reset = clear.translate(Vec2::new(-(action_w + 6.0), 0.0));
+        if button_at(ui, reset, "Reset", !is_default) {
+            state.draft.keybindings.0.insert(action, defaults.0[&action].clone());
+        }
+        if button_at(ui, clear, "Clear", combo.is_some()) {
+            state.draft.keybindings.0.insert(action, String::new());
+        }
+    }
 }
 
 #[cfg(test)]
