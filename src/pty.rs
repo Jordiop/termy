@@ -63,6 +63,20 @@ pub fn find_in_path(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&path).map(|dir| dir.join(name)).find(|p| p.is_file())
 }
 
+/// A short, readable message for a child that failed to start. A missing
+/// program (the usual case: an agent CLI that isn't installed) says so
+/// instead of dumping the raw `CreateProcessW` / `execvp` error.
+fn spawn_error(program: &str, e: &dyn std::fmt::Display) -> String {
+    let message = e.to_string();
+    // ENOENT on Unix, ERROR_FILE_NOT_FOUND on Windows: both are error 2.
+    let not_found = message.contains("os error 2)") || message.contains("No such file or directory");
+    if not_found {
+        format!("Could not start `{program}`: it isn't installed or isn't on PATH.")
+    } else {
+        format!("Could not start `{program}`: {message}")
+    }
+}
+
 /// A running child attached to a pseudo-terminal.
 pub struct PtyHandle {
     master: Mutex<Box<dyn MasterPty + Send>>,
@@ -101,7 +115,7 @@ impl PtyHandle {
         let mut child = pair
             .slave
             .spawn_command(cmd)
-            .map_err(|e| format!("could not start `{}`: {e}", opts.program))?;
+            .map_err(|e| spawn_error(&opts.program, &e))?;
         // The child holds its own copy; dropping ours lets EOF propagate.
         drop(pair.slave);
 
