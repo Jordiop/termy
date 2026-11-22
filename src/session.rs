@@ -724,6 +724,7 @@ impl Session {
         SessionSummary {
             id: self.id,
             title: self.title(),
+            renamed: self.custom_title.is_some(),
             subtitle: self.task_title().unwrap_or_else(|| state.label().to_owned()),
             icon: self.detected_icon().map(str::to_owned).unwrap_or_else(|| self.kind.icon.clone()),
             profile: self.kind.profile.clone(),
@@ -748,6 +749,8 @@ impl Session {
 pub struct SessionSummary {
     pub id: SessionId,
     pub title: String,
+    /// The user named this session; the name wins over the agent's task title.
+    pub renamed: bool,
     pub subtitle: String,
     pub icon: String,
     pub profile: Option<String>,
@@ -1112,6 +1115,7 @@ mod tests {
         SessionSummary {
             id,
             title: title.into(),
+            renamed: false,
             subtitle: state.label().into(),
             icon: "claude".into(),
             profile: Some("Claude Code".into()),
