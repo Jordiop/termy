@@ -36,6 +36,16 @@ On Windows/Linux, letter shortcuts use Ctrl+Shift so plain Ctrl+letter keeps
 reaching the shell. Everything is rebindable in Settings → Keybindings (press
 the new combination) or in `[keybindings]`.
 
+**Tabs**: double-click a tab (or a sidebar card) to rename it; Enter saves,
+Escape cancels, an empty name restores the automatic one. Right-click for
+Rename / Reset name / Close.
+
+**Images**: paste copies an image as a PNG in the temp folder and pastes its
+path, which Claude Code and Codex attach as an image. Copied files paste their
+paths, and so do files dropped on the window. On Windows/Linux plain Ctrl+V
+does the same when the clipboard holds an image or files (with text it is
+still sent to the program as ^V).
+
 ## Configuration
 
 `~/.config/termy/config.toml` (or `$XDG_CONFIG_HOME/termy`, or
@@ -43,7 +53,9 @@ the new combination) or in `[keybindings]`.
 you edit the file or use the settings panel. Saving from the panel keeps your
 comments and formatting.
 
-* `[window]` opacity, padding, decorations, initial size, sidebar, pane footer
+* `[window]` opacity, padding, decorations, initial size, sidebar, pane footer,
+  tabs: `tab_style` (`rounded` / `pill` / `flat` / `underline`), `tab_radius`,
+  `tab_max_width`
 * `[font]` family, size, line height, ligatures
 * `[cursor]` shape (`block` / `beam` / `underline`), blink
 * `[terminal]` shell and args, working directory, scrollback, scroll speed,

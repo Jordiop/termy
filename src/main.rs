@@ -11,6 +11,7 @@ mod app;
 mod chrome;
 mod config;
 mod input;
+mod paste;
 mod pty;
 mod renderer;
 mod resources;

@@ -269,9 +269,22 @@ fn appearance(ui: &mut egui::Ui, state: &mut SettingsState, input: &SettingsInpu
         ui.end_row();
         ui.label("Tab style");
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut draft.window.tab_style, TabStyle::Flat, "Flat");
+            ui.selectable_value(&mut draft.window.tab_style, TabStyle::Rounded, "Rounded");
             ui.selectable_value(&mut draft.window.tab_style, TabStyle::Pill, "Pill");
+            ui.selectable_value(&mut draft.window.tab_style, TabStyle::Flat, "Flat");
+            ui.selectable_value(&mut draft.window.tab_style, TabStyle::Underline, "Underline");
         });
+        ui.end_row();
+        if matches!(draft.window.tab_style, TabStyle::Rounded | TabStyle::Pill) {
+            ui.label("Tab corner radius");
+            ui.add(egui::Slider::new(&mut draft.window.tab_radius, 0.0..=14.0).step_by(1.0).suffix(" pt"));
+            ui.end_row();
+        }
+        ui.label("Tab max width");
+        ui.add(egui::Slider::new(&mut draft.window.tab_max_width, 100.0..=320.0).step_by(1.0).suffix(" pt"));
+        ui.end_row();
+        ui.label("Rename tabs");
+        ui.label(RichText::new("Double-click a tab, or right-click → Rename").size(11.5).color(c32(input.colors.text_dim)));
         ui.end_row();
         ui.label("Decorations");
         ui.horizontal(|ui| {

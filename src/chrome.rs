@@ -43,6 +43,8 @@ pub enum UiAction {
     OpenUsage,
     RestoreArchived(usize),
     RemoveArchived(usize),
+    /// New name for a session; empty restores the automatic name.
+    RenameSession(SessionId, String),
 }
 
 /// Sidebar UI state that persists across frames.
@@ -53,6 +55,23 @@ pub struct ChromeState {
     /// Set by the "search sessions" shortcut; consumed on the next frame.
     pub focus_search: bool,
     pub archived_open: bool,
+    /// Session whose name is being edited inline (tab or sidebar card).
+    pub renaming: Option<Renaming>,
+}
+
+pub struct Renaming {
+    pub id: SessionId,
+    pub text: String,
+    /// Focus the text field on the next frame.
+    pub focus: bool,
+}
+
+impl ChromeState {
+    fn start_rename(&mut self, id: SessionId, current: String) {
+        if id != USAGE_TAB {
+            self.renaming = Some(Renaming { id, text: current, focus: true });
+        }
+    }
 }
 
 /// Token usage of the agent running in a session, from the local monitor.
@@ -81,6 +100,8 @@ pub struct ChromeInput<'a> {
     pub sidebar_width: f32,
     pub pane_footer: bool,
     pub tab_style: TabStyle,
+    pub tab_radius: f32,
+    pub tab_max_width: f32,
     /// Space reserved at the top-left for native window controls (macOS).
     pub traffic_lights: Option<Vec2>,
     /// Sessions whose viewport is scrolled up.
@@ -286,7 +307,7 @@ pub fn draw(root: &mut egui::Ui, state: &mut ChromeState, input: &ChromeInput<'_
                 0.0
             };
             let tabs = Rect::from_min_size(rect.min, Vec2::new(rect.width(), TAB_BAR_HEIGHT));
-            tab_bar(ui, pane_id, tabs, inset, input, &mut out);
+            tab_bar(ui, state, pane_id, tabs, inset, input, &mut out);
             if inset > 0.0 {
                 let x = input.traffic_lights.map(|v| v.x).unwrap_or(0.0) + 2.0;
                 sidebar_toggle(ui, Rect::from_min_size(Pos2::new(rect.left() + x, rect.top() + 4.0), Vec2::splat(22.0)), colors, &mut out);
@@ -418,7 +439,7 @@ fn sidebar(ui: &mut egui::Ui, state: &mut ChromeState, input: &ChromeInput<'_>, 
             ui.label(egui::RichText::new(&group.name).color(c32(colors.text_dim)).size(11.5));
             ui.add_space(2.0);
             for s in &group.sessions {
-                session_card(ui, s, focused == Some(s.id), input, out);
+                session_card(ui, state, s, focused == Some(s.id), input, out);
             }
         }
     });
@@ -519,7 +540,7 @@ fn archived_list(ui: &mut egui::Ui, input: &ChromeInput<'_>, out: &mut ChromeOut
     }
 }
 
-fn session_card(ui: &mut egui::Ui, s: &SessionSummary, selected: bool, input: &ChromeInput<'_>, out: &mut ChromeOutput) {
+fn session_card(ui: &mut egui::Ui, state: &mut ChromeState, s: &SessionSummary, selected: bool, input: &ChromeInput<'_>, out: &mut ChromeOutput) {
     let colors = input.colors;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click());
     let p = ui.painter();
@@ -538,7 +559,10 @@ fn session_card(ui: &mut egui::Ui, s: &SessionSummary, selected: bool, input: &C
     let text_left = rect.left() + 26.0;
     let elapsed = format_elapsed(s.elapsed);
     let title_rect = Rect::from_min_max(Pos2::new(text_left, rect.top() + 4.0), Pos2::new(rect.right() - 34.0, rect.top() + 20.0));
-    p.with_clip_rect(title_rect).text(Pos2::new(text_left, rect.top() + 13.0), Align2::LEFT_CENTER, &s.title, FontId::proportional(12.5), c32(colors.text_primary));
+    if !rename_field(ui, state, s.id, title_rect, 12.5, colors, out) {
+        ui.painter().with_clip_rect(title_rect).text(Pos2::new(text_left, rect.top() + 13.0), Align2::LEFT_CENTER, &s.title, FontId::proportional(12.5), c32(colors.text_primary));
+    }
+    let p = ui.painter();
     p.text(Pos2::new(rect.right() - 6.0, rect.top() + 13.0), Align2::RIGHT_CENTER, elapsed, FontId::proportional(11.0), c32(colors.text_dim));
 
     // Tokens used (or left in the session budget) on the second line.
@@ -562,12 +586,64 @@ fn session_card(ui: &mut egui::Ui, s: &SessionSummary, selected: bool, input: &C
     let sub_rect = Rect::from_min_max(Pos2::new(text_left, rect.top() + 20.0), Pos2::new(rect.right() - 6.0 - tokens_w, rect.bottom()));
     p.with_clip_rect(sub_rect).text(Pos2::new(text_left, rect.top() + 28.0), Align2::LEFT_CENTER, &s.subtitle, FontId::proportional(11.0), c32(sub_color));
 
-    if resp.clicked() {
+    if resp.double_clicked() {
+        state.start_rename(s.id, s.title.clone());
+    } else if resp.clicked() {
         out.actions.push(UiAction::FocusSession(s.id));
+    }
+    resp.context_menu(|ui| session_menu(ui, state, s.id, s.title.clone(), s.renamed, out));
+}
+
+/// Right-click menu shared by tabs and sidebar cards.
+fn session_menu(ui: &mut egui::Ui, state: &mut ChromeState, id: SessionId, current: String, renamed: bool, out: &mut ChromeOutput) {
+    if id != USAGE_TAB {
+        if ui.button("Rename…").clicked() {
+            state.start_rename(id, current);
+            ui.close();
+        }
+        if renamed && ui.button("Reset name").clicked() {
+            out.actions.push(UiAction::RenameSession(id, String::new()));
+            ui.close();
+        }
+        ui.separator();
+    }
+    if ui.button("Close").clicked() {
+        out.actions.push(UiAction::CloseSession(id));
+        ui.close();
     }
 }
 
-fn tab_bar(ui: &mut egui::Ui, pane_id: PaneId, rect: Rect, inset: f32, input: &ChromeInput<'_>, out: &mut ChromeOutput) {
+/// Draws the inline name editor when `id` is being renamed. Enter or
+/// clicking away saves, Escape cancels. Returns whether it was drawn.
+fn rename_field(ui: &mut egui::Ui, state: &mut ChromeState, id: SessionId, rect: Rect, size: f32, colors: &UiColors, out: &mut ChromeOutput) -> bool {
+    let Some(r) = state.renaming.as_mut().filter(|r| r.id == id) else { return false };
+    ui.painter().rect_filled(rect.expand2(Vec2::new(3.0, 1.0)), CornerRadius::same(4), c32(colors.input_background));
+    let edit = egui::TextEdit::singleline(&mut r.text)
+        .id(ui.scope_id().with(("rename", id)))
+        .frame(egui::Frame::NONE)
+        .margin(egui::Margin::ZERO)
+        .font(FontId::proportional(size))
+        .text_color(c32(colors.text_primary))
+        .desired_width(rect.width());
+    let resp = ui.put(rect, edit);
+    if std::mem::take(&mut r.focus) {
+        resp.request_focus();
+        if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), resp.id) {
+            let all = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(r.text.chars().count()));
+            st.cursor.set_char_range(Some(all));
+            st.store(ui.ctx(), resp.id);
+        }
+    } else if resp.lost_focus() || !resp.has_focus() {
+        let cancelled = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        if !cancelled {
+            out.actions.push(UiAction::RenameSession(id, r.text.clone()));
+        }
+        state.renaming = None;
+    }
+    true
+}
+
+fn tab_bar(ui: &mut egui::Ui, state: &mut ChromeState, pane_id: PaneId, rect: Rect, inset: f32, input: &ChromeInput<'_>, out: &mut ChromeOutput) {
     let colors = input.colors;
     let Some(pane) = input.workspace.pane(pane_id) else { return };
     let focused_pane = input.workspace.focused_pane() == Some(pane_id);
@@ -579,9 +655,14 @@ fn tab_bar(ui: &mut egui::Ui, pane_id: PaneId, rect: Rect, inset: f32, input: &C
         out.actions.push(UiAction::DragWindow);
     }
 
+    let style = input.tab_style;
+    let radius = input.tab_radius.round().clamp(0.0, 14.0) as u8;
+    let accent = if focused_pane { colors.accent } else { colors.text_dim };
     let plus_w = 28.0;
     let avail = (rect.width() - inset - plus_w).max(0.0);
-    let tab_w = (avail / pane.tabs.len().max(1) as f32).clamp(60.0, 190.0);
+    let tab_w = (avail / pane.tabs.len().max(1) as f32).clamp(60.0, input.tab_max_width.max(60.0));
+    // Rounded tabs start lower, so their content sits a bit lower too.
+    let dy = if style == TabStyle::Rounded { 2.5 } else { 0.0 };
     let mut x = rect.left() + inset;
     for (index, sid) in pane.tabs.iter().enumerate() {
         let tab = Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(tab_w, rect.height()));
@@ -589,55 +670,113 @@ fn tab_bar(ui: &mut egui::Ui, pane_id: PaneId, rect: Rect, inset: f32, input: &C
         let summary = input.summaries.iter().find(|s| s.id == *sid);
         let active = index == pane.active;
         let resp = ui.interact(tab, ui.scope_id().with(("tab", pane_id, *sid)), Sense::click());
+        let hovered = resp.hovered();
         let p = ui.painter();
-        let pill = input.tab_style == TabStyle::Pill;
-        let shape = if pill { tab.shrink2(Vec2::new(2.0, 4.0)) } else { tab };
-        let radius = if pill { CornerRadius::same(6) } else { CornerRadius::ZERO };
-        if active {
-            let fill = if pill { colors.pill_selected_background } else { input.terminal_background };
-            p.rect_filled(shape, radius, c32(fill));
-            if focused_pane && !pill {
-                p.line_segment([tab.left_top(), tab.right_top()], Stroke::new(1.5, c32(colors.accent)));
+
+        match style {
+            TabStyle::Flat => {
+                if active {
+                    p.rect_filled(tab, CornerRadius::ZERO, c32(input.terminal_background));
+                    if focused_pane {
+                        p.line_segment([tab.left_top(), tab.right_top()], Stroke::new(1.5, c32(colors.accent)));
+                    }
+                } else if hovered {
+                    p.rect_filled(tab, CornerRadius::ZERO, c32(colors.button_background));
+                }
             }
-        } else if resp.hovered() {
-            p.rect_filled(shape, radius, c32(colors.button_background));
+            TabStyle::Rounded => {
+                // Joins the terminal below: only the top corners are rounded.
+                let shape = Rect::from_min_max(Pos2::new(tab.left() + 2.0, tab.top() + 5.0), Pos2::new(tab.right() - 2.0, tab.bottom()));
+                if active {
+                    let corners = CornerRadius { nw: radius, ne: radius, sw: 0, se: 0 };
+                    p.rect_filled(shape, corners, c32(input.terminal_background));
+                    // Outline the top and sides; the bottom edge hangs below
+                    // the bar (clipped) so the tab flows into the terminal.
+                    let outline = Rect::from_min_max(shape.min, Pos2::new(shape.right(), shape.bottom() + 2.0));
+                    p.with_clip_rect(rect).rect_stroke(outline, corners, Stroke::new(1.0, c32(colors.border)), StrokeKind::Inside);
+                    if focused_pane {
+                        let r = radius as f32;
+                        let top = shape.top() + 0.5;
+                        p.line_segment([Pos2::new(shape.left() + r, top), Pos2::new(shape.right() - r, top)], Stroke::new(1.5, c32(colors.accent)));
+                    }
+                } else if hovered {
+                    let hover = Rect::from_min_max(shape.min, Pos2::new(shape.right(), shape.bottom() - 4.0));
+                    p.rect_filled(hover, CornerRadius::same(radius), c32(colors.button_background));
+                } else if index + 1 < pane.tabs.len() && index + 1 != pane.active {
+                    // Thin divider between two inactive tabs.
+                    let dx = tab.right();
+                    p.line_segment([Pos2::new(dx, tab.top() + 11.0), Pos2::new(dx, tab.bottom() - 7.0)], Stroke::new(1.0, c32(colors.border)));
+                }
+            }
+            TabStyle::Pill => {
+                let shape = tab.shrink2(Vec2::new(2.0, 4.0));
+                if active {
+                    p.rect_filled(shape, CornerRadius::same(radius), c32(colors.pill_selected_background));
+                } else if hovered {
+                    p.rect_filled(shape, CornerRadius::same(radius), c32(colors.button_background));
+                }
+            }
+            TabStyle::Underline => {
+                let y = tab.bottom() - 1.5;
+                let line = [Pos2::new(tab.left() + 8.0, y), Pos2::new(tab.right() - 8.0, y)];
+                if active {
+                    p.line_segment(line, Stroke::new(2.0, c32(accent)));
+                } else if hovered {
+                    p.line_segment(line, Stroke::new(1.0, c32(colors.border)));
+                }
+            }
         }
-        let (title, icon, profile, attention) = match summary {
-            Some(s) => (s.subtitle_or_title(), s.icon.as_str(), s.profile.as_deref(), s.attention),
-            None if *sid == USAGE_TAB => ("Usage".into(), "chart", None, false),
-            None => ("…".into(), "shell", None, false),
+        let cy = tab.center().y + dy;
+
+        let (title, icon, profile, attention, renamed) = match summary {
+            Some(s) => (s.tab_label(), s.icon.as_str(), s.profile.as_deref(), s.attention, s.renamed),
+            None if *sid == USAGE_TAB => ("Usage".into(), "chart", None, false, false),
+            None => ("…".into(), "shell", None, false, false),
         };
         let color = if *sid == USAGE_TAB { c32(colors.accent) } else { agent_color(input.agents, profile, icon, colors) };
-        let icon_pos = Pos2::new(tab.left() + 14.0, tab.center().y);
+        let icon_pos = Pos2::new(tab.left() + 14.0, cy);
         paint_icon(p, icon_pos, 5.5, icon, color);
         if attention && !active {
             p.circle_filled(icon_pos + Vec2::new(5.0, -5.0), 2.5, c32(colors.status_done));
         }
-        let text_color = if active { colors.text_primary } else { colors.text_dim };
-        let text_rect = Rect::from_min_max(Pos2::new(tab.left() + 26.0, tab.top()), Pos2::new(tab.right() - 22.0, tab.bottom()));
-        p.with_clip_rect(text_rect).text(Pos2::new(text_rect.left(), tab.center().y), Align2::LEFT_CENTER, title, FontId::proportional(12.0), c32(text_color));
+        let text_color = if active || (hovered && style == TabStyle::Underline) { colors.text_primary } else { colors.text_dim };
+        let text_rect = Rect::from_min_max(Pos2::new(tab.left() + 26.0, cy - 8.0), Pos2::new(tab.right() - 22.0, cy + 8.0));
+        let editing = rename_field(ui, state, *sid, text_rect, 12.0, colors, out);
+        if !editing {
+            ui.painter().with_clip_rect(text_rect).text(Pos2::new(text_rect.left(), cy), Align2::LEFT_CENTER, &title, FontId::proportional(12.0), c32(text_color));
+        }
 
         // Close button on hover / active.
-        let close = Rect::from_center_size(Pos2::new(tab.right() - 12.0, tab.center().y), Vec2::splat(16.0));
+        let close = Rect::from_center_size(Pos2::new(tab.right() - 12.0, cy), Vec2::splat(16.0));
         let close_resp = ui.interact(close, ui.scope_id().with(("close", *sid)), Sense::click());
-        if active || resp.hovered() || close_resp.hovered() {
+        if !editing && (active || hovered || close_resp.hovered()) {
             let c = if close_resp.hovered() { colors.text_primary } else { colors.text_dim };
             let k = 3.5;
             let p = ui.painter();
+            if close_resp.hovered() {
+                p.rect_filled(close, CornerRadius::same(4), c32(colors.button_background));
+            }
             p.line_segment([close.center() + Vec2::new(-k, -k), close.center() + Vec2::new(k, k)], Stroke::new(1.2, c32(c)));
             p.line_segment([close.center() + Vec2::new(k, -k), close.center() + Vec2::new(-k, k)], Stroke::new(1.2, c32(c)));
         }
         if close_resp.clicked() {
             out.actions.push(UiAction::CloseSession(*sid));
+        } else if resp.double_clicked() {
+            state.start_rename(*sid, title.clone());
         } else if resp.clicked() {
             out.actions.push(UiAction::ActivateTab(pane_id, index));
         }
+        resp.context_menu(|ui| session_menu(ui, state, *sid, title.clone(), renamed, out));
     }
 
     let plus = Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(plus_w, rect.height()));
     let resp = ui.interact(plus, ui.scope_id().with(("plus", pane_id)), Sense::click());
     let c = if resp.hovered() { colors.text_primary } else { colors.text_dim };
-    ui.painter().text(plus.center(), Align2::CENTER_CENTER, "+", FontId::proportional(15.0), c32(c));
+    let plus_center = plus.center() + Vec2::new(0.0, dy);
+    if resp.hovered() {
+        ui.painter().rect_filled(Rect::from_center_size(plus_center, Vec2::splat(20.0)), CornerRadius::same(radius.min(10)), c32(colors.button_background));
+    }
+    ui.painter().text(plus_center, Align2::CENTER_CENTER, "+", FontId::proportional(15.0), c32(c));
     if resp.on_hover_text("New tab").clicked() {
         out.actions.push(UiAction::NewTab(pane_id));
     }
@@ -774,8 +913,9 @@ fn empty_state(ui: &mut egui::Ui, area: Rect, input: &ChromeInput<'_>, out: &mut
 }
 
 impl SessionSummary {
-    /// Tab label: the task an agent reported (OSC title), else the name.
-    fn subtitle_or_title(&self) -> String {
-        if self.subtitle != self.state.label() { self.subtitle.clone() } else { self.title.clone() }
+    /// Tab label: a name the user gave, else the task an agent reported
+    /// (OSC title), else the session name.
+    fn tab_label(&self) -> String {
+        if !self.renamed && self.subtitle != self.state.label() { self.subtitle.clone() } else { self.title.clone() }
     }
 }

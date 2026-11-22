@@ -208,6 +208,17 @@ impl App {
         self.clipboard.as_mut()
     }
 
+    fn paste_into_focused(&mut self, text: &str) {
+        if let Some(s) = self.focused() {
+            s.with_term(|t| t.selection = None);
+            s.scroll_to_bottom();
+            s.clear_attention();
+            s.paste(text);
+            self.blink_epoch = Instant::now();
+        }
+        self.request_redraw();
+    }
+
     // --- Window creation ----------------------------------------------------
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
@@ -423,10 +434,9 @@ impl App {
                 }
             }
             Action::Paste => {
-                let text = self.clipboard().and_then(|cb| cb.get_text().ok());
-                if let (Some(text), Some(s)) = (text, self.focused()) {
-                    s.scroll_to_bottom();
-                    s.paste(&text);
+                let text = self.clipboard().and_then(crate::paste::clipboard_text);
+                if let Some(text) = text {
+                    self.paste_into_focused(&text);
                 }
             }
             Action::NewSession => self.spawn(None, None),
@@ -497,6 +507,12 @@ impl App {
                 }
             }
             UiAction::RemoveArchived(index) => self.sessions.remove_archived(index),
+            UiAction::RenameSession(id, name) => {
+                if let Some(s) = self.sessions.get_mut(id) {
+                    let name = name.trim();
+                    s.custom_title = (!name.is_empty()).then(|| name.to_owned());
+                }
+            }
             UiAction::DragWindow => {
                 if let Some(g) = &self.gfx {
                     let _ = g.window.drag_window();
@@ -640,6 +656,17 @@ impl App {
         }
         // Unbound Cmd/Super shortcuts never reach the shell as text.
         if self.modifiers.super_key() {
+            return true;
+        }
+        // Ctrl+V (unbound) with an image or files on the clipboard pastes
+        // their path, as Windows Terminal does; with text it stays ^V.
+        let plain_ctrl = self.modifiers.control_key() && !self.modifiers.shift_key() && !self.modifiers.alt_key();
+        if plain_ctrl
+            && matches!(&key, Key::Character(c) if c.eq_ignore_ascii_case("v"))
+            && self.focused().is_some()
+            && let Some(text) = self.clipboard().and_then(crate::paste::clipboard_non_text)
+        {
+            self.paste_into_focused(&text);
             return true;
         }
         let Some(session) = self.focused() else { return false };
@@ -898,6 +925,8 @@ impl App {
             sidebar_width: config.window.sidebar_width as f32,
             pane_footer: config.window.pane_footer,
             tab_style: config.window.tab_style,
+            tab_radius: config.window.tab_radius.clamp(0.0, 14.0) as f32,
+            tab_max_width: config.window.tab_max_width.clamp(80.0, 400.0) as f32,
             traffic_lights,
             scrolled: &scrolled,
             new_session_shortcut,
@@ -1125,6 +1154,11 @@ impl ApplicationHandler<UserEvent> for App {
                 self.request_redraw();
             }
             WindowEvent::RedrawRequested => self.redraw(),
+            // Files dropped on the window paste their (quoted) paths.
+            WindowEvent::DroppedFile(path) if !self.settings.open => {
+                let text = crate::paste::quote_path(&path);
+                self.paste_into_focused(&format!("{text} "));
+            }
             _ => {}
         }
     }
