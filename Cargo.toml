@@ -1,6 +1,6 @@
 [package]
 name = "termy"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 # egui / egui-wgpu / egui-winit 0.37 and parking_lot 0.13 require Rust 1.95.
 rust-version = "1.95"
