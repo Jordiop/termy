@@ -33,73 +33,165 @@ pub enum SplitDir {
     Horizontal,
 }
 
+/// Smallest share a pane can be resized down to.
+const MIN_SHARE: f32 = 0.05;
+
 #[derive(Clone, Debug, PartialEq)]
 enum Node {
     Leaf(PaneId),
-    Split { dir: SplitDir, ratio: f32, first: Box<Node>, second: Box<Node> },
+    /// Any number of children laid out along `dir`; `sizes` are their shares
+    /// of the space (summing to 1).
+    Split { dir: SplitDir, children: Vec<Node>, sizes: Vec<f32> },
+}
+
+/// A draggable boundary between children `index` and `index + 1` of the
+/// split at `path` (child indices from the root).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Divider {
+    pub path: Vec<usize>,
+    pub index: usize,
+    pub dir: SplitDir,
+    /// The gap between the two children.
+    pub rect: Rect,
+    /// Space shared by the split's children (gaps excluded), to turn a
+    /// pixel delta into a share.
+    pub extent: f32,
+}
+
+/// Where a dragged tab lands.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DropTarget {
+    /// Into `pane`'s tab bar at `index`.
+    Tab { pane: PaneId, index: usize },
+    /// Into a new pane beside `pane` (`before` = left of / above it).
+    Split { pane: PaneId, dir: SplitDir, before: bool },
 }
 
 impl Node {
+    /// Builds a split, collapsing a single child and merging children that
+    /// split the same way (so N panes side by side share one level).
+    fn split(dir: SplitDir, children: Vec<Node>, sizes: Vec<f32>) -> Option<Node> {
+        let total: f32 = sizes.iter().sum();
+        let mut flat_c = Vec::with_capacity(children.len());
+        let mut flat_s = Vec::with_capacity(children.len());
+        for (child, size) in children.into_iter().zip(sizes) {
+            let share = if total > 0.0 { size / total } else { 0.0 };
+            match child {
+                Node::Split { dir: d, children: inner, sizes: inner_sizes } if d == dir => {
+                    for (c, s) in inner.into_iter().zip(inner_sizes) {
+                        flat_c.push(c);
+                        flat_s.push(s * share);
+                    }
+                }
+                other => {
+                    flat_c.push(other);
+                    flat_s.push(share);
+                }
+            }
+        }
+        match flat_c.len() {
+            0 => None,
+            1 => flat_c.pop(),
+            n => {
+                let sum: f32 = flat_s.iter().sum();
+                let sizes = if sum > 0.0 { flat_s.iter().map(|s| s / sum).collect() } else { vec![1.0 / n as f32; n] };
+                Some(Node::Split { dir, children: flat_c, sizes })
+            }
+        }
+    }
+
     fn leaves(&self, out: &mut Vec<PaneId>) {
         match self {
             Node::Leaf(id) => out.push(*id),
-            Node::Split { first, second, .. } => {
-                first.leaves(out);
-                second.leaves(out);
-            }
+            Node::Split { children, .. } => children.iter().for_each(|c| c.leaves(out)),
         }
     }
 
-    /// Replaces leaf `target` with `with`. Returns whether it was found.
-    fn replace_leaf(&mut self, target: PaneId, with: &mut Option<Node>) -> bool {
+    /// Puts leaf `new` next to leaf `target`. Splitting the same way as the
+    /// parent adds a sibling (one more equal share) instead of nesting.
+    fn insert_beside(&mut self, target: PaneId, new: PaneId, dir: SplitDir, before: bool) -> bool {
         match self {
             Node::Leaf(id) if *id == target => {
-                if let Some(node) = with.take() {
-                    *self = node;
+                let mut children = vec![Node::Leaf(target), Node::Leaf(new)];
+                if before {
+                    children.reverse();
                 }
+                *self = Node::Split { dir, children, sizes: vec![0.5, 0.5] };
                 true
             }
             Node::Leaf(_) => false,
-            Node::Split { first, second, .. } => first.replace_leaf(target, with) || second.replace_leaf(target, with),
+            Node::Split { dir: d, children, sizes } => {
+                if *d == dir
+                    && let Some(i) = children.iter().position(|c| *c == Node::Leaf(target))
+                {
+                    let n = children.len() as f32 + 1.0;
+                    sizes.iter_mut().for_each(|s| *s *= (n - 1.0) / n);
+                    let at = if before { i } else { i + 1 };
+                    children.insert(at, Node::Leaf(new));
+                    sizes.insert(at, 1.0 / n);
+                    return true;
+                }
+                children.iter_mut().any(|c| c.insert_beside(target, new, dir, before))
+            }
         }
     }
 
-    /// Removes leaf `target`, collapsing its parent split. `None` if the tree
-    /// becomes empty.
+    /// Removes leaf `target`; its siblings take the space. `None` if the
+    /// tree becomes empty.
     fn remove_leaf(self, target: PaneId) -> Option<Node> {
         match self {
             Node::Leaf(id) if id == target => None,
             leaf @ Node::Leaf(_) => Some(leaf),
-            Node::Split { dir, ratio, first, second } => match (first.remove_leaf(target), second.remove_leaf(target)) {
-                (Some(a), Some(b)) => Some(Node::Split { dir, ratio, first: Box::new(a), second: Box::new(b) }),
-                (Some(only), None) | (None, Some(only)) => Some(only),
-                (None, None) => None,
+            Node::Split { dir, children, sizes } => {
+                let (children, sizes): (Vec<_>, Vec<_>) =
+                    children.into_iter().zip(sizes).filter_map(|(c, s)| Some((c.remove_leaf(target)?, s))).unzip();
+                Node::split(dir, children, sizes)
+            }
+        }
+    }
+
+    fn at_path_mut(&mut self, path: &[usize]) -> Option<&mut Node> {
+        match path.split_first() {
+            None => Some(self),
+            Some((i, rest)) => match self {
+                Node::Split { children, .. } => children.get_mut(*i)?.at_path_mut(rest),
+                Node::Leaf(_) => None,
             },
         }
     }
 
-    fn layout(&self, rect: Rect, gap: f32, out: &mut Vec<(PaneId, Rect)>) {
+    fn layout(&self, rect: Rect, gap: f32, path: &mut Vec<usize>, panes: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<Divider>) {
         match self {
-            Node::Leaf(id) => out.push((*id, rect)),
-            Node::Split { dir, ratio, first, second } => {
-                let (a, b) = match dir {
-                    SplitDir::Vertical => {
-                        let w1 = ((rect.w - gap) * ratio).round();
-                        (
-                            Rect::new(rect.x, rect.y, w1, rect.h),
-                            Rect::new(rect.x + w1 + gap, rect.y, rect.w - w1 - gap, rect.h),
-                        )
-                    }
-                    SplitDir::Horizontal => {
-                        let h1 = ((rect.h - gap) * ratio).round();
-                        (
-                            Rect::new(rect.x, rect.y, rect.w, h1),
-                            Rect::new(rect.x, rect.y + h1 + gap, rect.w, rect.h - h1 - gap),
-                        )
-                    }
+            Node::Leaf(id) => panes.push((*id, rect)),
+            Node::Split { dir, children, sizes } => {
+                let n = children.len();
+                let (start, extent) = match dir {
+                    SplitDir::Vertical => (rect.x, rect.w),
+                    SplitDir::Horizontal => (rect.y, rect.h),
                 };
-                first.layout(a, gap, out);
-                second.layout(b, gap, out);
+                let avail = (extent - gap * (n.saturating_sub(1)) as f32).max(0.0);
+                let mut pos = start;
+                let mut used = 0.0;
+                for (i, (child, share)) in children.iter().zip(sizes).enumerate() {
+                    let len = if i + 1 == n { avail - used } else { (avail * share).round().min(avail - used) };
+                    used += len;
+                    let r = match dir {
+                        SplitDir::Vertical => Rect::new(pos, rect.y, len, rect.h),
+                        SplitDir::Horizontal => Rect::new(rect.x, pos, rect.w, len),
+                    };
+                    path.push(i);
+                    child.layout(r, gap, path, panes, dividers);
+                    path.pop();
+                    pos += len;
+                    if i + 1 < n {
+                        let rect = match dir {
+                            SplitDir::Vertical => Rect::new(pos, rect.y, gap, rect.h),
+                            SplitDir::Horizontal => Rect::new(rect.x, pos, rect.w, gap),
+                        };
+                        dividers.push(Divider { path: path.clone(), index: i, dir: *dir, rect, extent: avail });
+                    }
+                    pos += gap;
+                }
             }
         }
     }
@@ -194,27 +286,26 @@ impl Workspace {
     }
 
     /// Splits the focused pane, putting `session` in the new pane (right of
-    /// or below the current one), and focuses it.
+    /// or below the current one), and focuses it. Splitting again the same
+    /// way adds another pane beside it: there is no limit.
     pub fn split(&mut self, dir: SplitDir, session: SessionId) -> PaneId {
         let Some(target) = self.focused.filter(|id| self.pane(*id).is_some()) else {
             self.add_session(session);
             return self.focused.expect("pane created");
         };
+        self.split_beside(target, dir, false, session)
+    }
+
+    fn split_beside(&mut self, target: PaneId, dir: SplitDir, before: bool, session: SessionId) -> PaneId {
         let new_id = self.new_pane(session);
-        let mut replacement = Some(Node::Split {
-            dir,
-            ratio: 0.5,
-            first: Box::new(Node::Leaf(target)),
-            second: Box::new(Node::Leaf(new_id)),
-        });
         if let Some(root) = &mut self.root {
-            root.replace_leaf(target, &mut replacement);
+            root.insert_beside(target, new_id, dir, before);
         }
         self.focused = Some(new_id);
         new_id
     }
 
-    /// Removes a session's tab; empty panes disappear and their sibling takes
+    /// Removes a session's tab; empty panes disappear and their siblings take
     /// the space. Returns whether the session was shown anywhere.
     pub fn remove_session(&mut self, session: SessionId) -> bool {
         let Some(pane_id) = self.pane_of(session) else { return false };
@@ -236,6 +327,76 @@ impl Workspace {
             }
         }
         true
+    }
+
+    /// Moves a tab (drag and drop): into a pane's tab bar at an index
+    /// (reordering within its own pane), or into a new pane beside one. The
+    /// moved tab ends up active and focused. Returns whether anything moved.
+    pub fn move_tab(&mut self, session: SessionId, target: DropTarget) -> bool {
+        let Some(from) = self.pane_of(session) else { return false };
+        let from_len = self.pane(from).map_or(0, |p| p.tabs.len());
+        match target {
+            DropTarget::Tab { pane, index } => {
+                if self.pane(pane).is_none() {
+                    return false;
+                }
+                if pane == from {
+                    let p = self.pane_mut(pane).expect("pane exists");
+                    let old = p.tabs.iter().position(|s| *s == session).expect("tab exists");
+                    let new = if index > old { index - 1 } else { index }.min(p.tabs.len() - 1);
+                    let tab = p.tabs.remove(old);
+                    p.tabs.insert(new, tab);
+                    p.active = new;
+                    self.focused = Some(pane);
+                    return old != new;
+                }
+                self.remove_session(session);
+                let p = self.pane_mut(pane).expect("target pane survives: it is not the source");
+                let index = index.min(p.tabs.len());
+                p.tabs.insert(index, session);
+                p.active = index;
+                self.focused = Some(pane);
+                true
+            }
+            DropTarget::Split { pane, dir, before } => {
+                // A pane's only tab can't be split off from itself.
+                if self.pane(pane).is_none() || (pane == from && from_len == 1) {
+                    return false;
+                }
+                self.remove_session(session);
+                self.split_beside(pane, dir, before, session);
+                true
+            }
+        }
+    }
+
+    /// Moves the boundary after child `index` of the split at `path` by
+    /// `delta` (a share of the split's space), keeping both sides at least
+    /// `min` (a share too).
+    pub fn resize_split(&mut self, path: &[usize], index: usize, delta: f32, min: f32) {
+        let Some(Node::Split { sizes, .. }) = self.root.as_mut().and_then(|r| r.at_path_mut(path)) else { return };
+        if index + 1 >= sizes.len() {
+            return;
+        }
+        let min = min.clamp(MIN_SHARE, 0.45);
+        let pair = sizes[index] + sizes[index + 1];
+        let a = (sizes[index] + delta).clamp(min.min(pair / 2.0), (pair - min).max(pair / 2.0));
+        sizes[index] = a;
+        sizes[index + 1] = pair - a;
+    }
+
+    /// Resets every split to equal shares.
+    pub fn equalize(&mut self) {
+        fn walk(node: &mut Node) {
+            if let Node::Split { children, sizes, .. } = node {
+                let n = sizes.len() as f32;
+                sizes.iter_mut().for_each(|s| *s = 1.0 / n);
+                children.iter_mut().for_each(walk);
+            }
+        }
+        if let Some(root) = &mut self.root {
+            walk(root);
+        }
     }
 
     /// Focuses the pane showing `session` and activates its tab.
@@ -283,12 +444,18 @@ impl Workspace {
     }
 
     /// Pane rectangles for the given area, `gap` between siblings.
+    #[cfg(test)]
     pub fn layout(&self, area: Rect, gap: f32) -> Vec<(PaneId, Rect)> {
-        let mut out = Vec::new();
+        self.layout_with_dividers(area, gap).0
+    }
+
+    /// Pane rectangles plus the draggable boundaries between them.
+    pub fn layout_with_dividers(&self, area: Rect, gap: f32) -> (Vec<(PaneId, Rect)>, Vec<Divider>) {
+        let (mut panes, mut dividers) = (Vec::new(), Vec::new());
         if let Some(root) = &self.root {
-            root.layout(area, gap, &mut out);
+            root.layout(area, gap, &mut Vec::new(), &mut panes, &mut dividers);
         }
-        out
+        (panes, dividers)
     }
 }
 
@@ -397,5 +564,85 @@ mod tests {
         let mut ws = Workspace::new();
         ws.split(SplitDir::Horizontal, 7);
         assert_eq!(ws.visible_sessions(), [7]);
+    }
+    #[test]
+    fn repeated_splits_share_one_level_equally() {
+        let mut ws = Workspace::new();
+        ws.add_session(1);
+        for s in 2..=5 {
+            ws.split(SplitDir::Vertical, s);
+        }
+        let rects = ws.layout(Rect::new(0.0, 0.0, 500.0, 100.0), 0.0);
+        assert_eq!(rects.iter().map(|r| r.1.w).collect::<Vec<_>>(), [100.0; 5]);
+        assert_eq!(ws.visible_sessions(), [1, 2, 3, 4, 5]);
+        // Closing one gives its space back to the others, still one level.
+        ws.remove_session(3);
+        let rects = ws.layout(Rect::new(0.0, 0.0, 400.0, 100.0), 0.0);
+        assert_eq!(rects.iter().map(|r| r.1.w).collect::<Vec<_>>(), [100.0; 4]);
+    }
+
+    #[test]
+    fn dividers_resize_neighbours() {
+        let mut ws = Workspace::new();
+        ws.add_session(1);
+        ws.split(SplitDir::Vertical, 2);
+        ws.split(SplitDir::Vertical, 3);
+        let (_, dividers) = ws.layout_with_dividers(Rect::new(0.0, 0.0, 302.0, 10.0), 1.0);
+        assert_eq!(dividers.len(), 2);
+        assert_eq!(dividers[0].rect, Rect::new(100.0, 0.0, 1.0, 10.0));
+        let d = dividers[0].clone();
+        ws.resize_split(&d.path, d.index, 50.0 / d.extent, 0.1);
+        let rects = ws.layout(Rect::new(0.0, 0.0, 302.0, 10.0), 1.0);
+        assert_eq!(rects.iter().map(|r| r.1.w).collect::<Vec<_>>(), [150.0, 50.0, 100.0]);
+        // Can't shrink a pane below the minimum.
+        ws.resize_split(&d.path, d.index, 10.0, 0.1);
+        let rects = ws.layout(Rect::new(0.0, 0.0, 300.0, 10.0), 0.0);
+        assert_eq!(rects[1].1.w, 30.0);
+        ws.equalize();
+        let rects = ws.layout(Rect::new(0.0, 0.0, 300.0, 10.0), 0.0);
+        assert_eq!(rects.iter().map(|r| r.1.w).collect::<Vec<_>>(), [100.0; 3]);
+    }
+
+    #[test]
+    fn reorder_tabs_within_a_pane() {
+        let mut ws = Workspace::new();
+        for s in 1..=3 {
+            ws.add_session(s);
+        }
+        let pane = ws.focused_pane().unwrap();
+        assert!(ws.move_tab(1, DropTarget::Tab { pane, index: 3 }));
+        assert_eq!(ws.pane(pane).unwrap().tabs, [2, 3, 1]);
+        assert_eq!(ws.focused_session(), Some(1));
+        assert!(ws.move_tab(1, DropTarget::Tab { pane, index: 0 }));
+        assert_eq!(ws.pane(pane).unwrap().tabs, [1, 2, 3]);
+        assert!(!ws.move_tab(1, DropTarget::Tab { pane, index: 1 }));
+    }
+
+    #[test]
+    fn move_tabs_between_panes_and_into_splits() {
+        let mut ws = Workspace::new();
+        ws.add_session(1);
+        ws.add_session(2);
+        let left = ws.focused_pane().unwrap();
+        // Drag tab 2 to the right edge: a new pane.
+        assert!(ws.move_tab(2, DropTarget::Split { pane: left, dir: SplitDir::Vertical, before: false }));
+        let right = ws.pane_of(2).unwrap();
+        assert_ne!(left, right);
+        assert_eq!(ws.visible_sessions(), [1, 2]);
+        // A pane's only tab can't split off from itself.
+        assert!(!ws.move_tab(2, DropTarget::Split { pane: right, dir: SplitDir::Vertical, before: true }));
+        // Drag it back into the left tab bar: the right pane disappears.
+        assert!(ws.move_tab(2, DropTarget::Tab { pane: left, index: 0 }));
+        assert_eq!(ws.pane_order(), [left]);
+        assert_eq!(ws.pane(left).unwrap().tabs, [2, 1]);
+        assert_eq!(ws.focused_session(), Some(2));
+        // Moving the last tab of a pane next to another pane.
+        ws.split(SplitDir::Vertical, 3);
+        let third = ws.pane_of(3).unwrap();
+        assert!(ws.move_tab(3, DropTarget::Split { pane: left, dir: SplitDir::Horizontal, before: true }));
+        assert!(ws.pane(third).is_none());
+        let rects = ws.layout(Rect::new(0.0, 0.0, 10.0, 10.0), 0.0);
+        assert_eq!(rects.iter().map(|r| r.1).collect::<Vec<_>>(), [Rect::new(0.0, 0.0, 10.0, 5.0), Rect::new(0.0, 5.0, 10.0, 5.0)]);
+        assert_eq!(ws.visible_sessions(), [3, 2]);
     }
 }

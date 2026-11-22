@@ -75,7 +75,11 @@ struct MouseState {
 pub struct App {
     config_file: ConfigFile,
     config: AppConfig,
+    /// Last config.toml load/parse error (cleared by a good reload).
     config_error: Option<String>,
+    /// Last error from an action (a session that failed to start, …). Shown
+    /// in the sidebar until dismissed or replaced.
+    error: Option<String>,
     themes: ThemeRegistry,
     theme: Theme,
     sessions: SessionManager,
@@ -100,6 +104,8 @@ pub struct App {
     modifiers: ModifiersState,
     window_focused: bool,
     panes: Vec<PaneHit>,
+    /// Last frame's pane-divider grab areas (physical px).
+    dividers: Vec<Rect>,
     mouse: MouseState,
     blink_epoch: Instant,
     clipboard: Option<arboard::Clipboard>,
@@ -142,6 +148,7 @@ impl App {
             ),
             monitor: AiMonitor::start(&config, wake),
             config_error: error.map(|e| e.to_string()),
+            error: None,
             sidebar_visible: config.window.sidebar_visible,
             config_file,
             config,
@@ -161,6 +168,7 @@ impl App {
             modifiers: ModifiersState::empty(),
             window_focused: true,
             panes: Vec::new(),
+            dividers: Vec::new(),
             mouse: MouseState::default(),
             blink_epoch: Instant::now(),
             clipboard: None,
@@ -278,7 +286,7 @@ impl App {
             Some(name) => match self.config.agent(&name) {
                 Some(p) => Some(p.clone()),
                 None => {
-                    self.config_error = Some(format!("unknown agent profile {name:?}"));
+                    self.error = Some(format!("Unknown agent profile {name:?}"));
                     return;
                 }
             },
@@ -302,7 +310,7 @@ impl App {
                 }
                 self.blink_epoch = Instant::now();
             }
-            Err(e) => self.config_error = Some(e),
+            Err(e) => self.error = Some(e),
         }
         self.request_redraw();
     }
@@ -503,7 +511,7 @@ impl App {
                         self.workspace.add_session(id);
                         self.chrome.archived_open = false;
                     }
-                    Err(e) => self.config_error = Some(e),
+                    Err(e) => self.error = Some(e),
                 }
             }
             UiAction::RemoveArchived(index) => self.sessions.remove_archived(index),
@@ -517,6 +525,23 @@ impl App {
                 if let Some(g) = &self.gfx {
                     let _ = g.window.drag_window();
                 }
+            }
+            UiAction::MoveTab(id, target) => {
+                if self.workspace.move_tab(id, target)
+                    && let Some(s) = self.sessions.get(id)
+                {
+                    s.clear_attention();
+                }
+            }
+            UiAction::SplitPane(pane, dir) => {
+                self.workspace.focus_pane(pane);
+                self.spawn(None, Some(dir));
+            }
+            UiAction::ResizeSplit { path, index, delta, min } => self.workspace.resize_split(&path, index, delta, min),
+            UiAction::EqualizeSplits => self.workspace.equalize(),
+            UiAction::DismissError => {
+                self.error = None;
+                self.config_error = None;
             }
         }
         self.request_redraw();
@@ -688,6 +713,9 @@ impl App {
     }
 
     fn hit(&self, x: f64, y: f64) -> Option<PaneHit> {
+        if self.dividers.iter().any(|d| d.contains(x as f32, y as f32)) {
+            return None; // resizing panes, not clicking a terminal
+        }
         self.panes.iter().copied().find(|p| p.area.contains(x as f32, y as f32))
     }
 
@@ -907,7 +935,8 @@ impl App {
             }
         }
 
-        let Self { gfx, chrome, sessions, workspace, config, theme, themes, config_error, sidebar_visible, settings, font_families, stats, .. } = self;
+        let banner = self.error.clone().or_else(|| self.config_error.as_ref().map(|e| format!("config.toml: {e}")));
+        let Self { gfx, chrome, sessions, workspace, config, theme, themes, sidebar_visible, settings, font_families, stats, .. } = self;
         let Some(g) = gfx.as_mut() else { return };
         let scrolled: Vec<SessionId> = workspace.visible_sessions().into_iter().filter(|id| sessions.get(*id).is_some_and(|s| s.is_scrolled())).collect();
         let ui_colors = theme.ui();
@@ -931,7 +960,7 @@ impl App {
             scrolled: &scrolled,
             new_session_shortcut,
             search_shortcut,
-            error: config_error.as_deref(),
+            error: banner.as_deref(),
         };
         let empty: Vec<String> = Vec::new();
         let settings_input = SettingsInput {
@@ -1018,6 +1047,7 @@ impl App {
         }
         drop(frames);
         self.panes = hits;
+        self.dividers = out.dividers.iter().map(|r| Rect::new(r.left() * ppp, r.top() * ppp, r.width() * ppp, r.height() * ppp)).collect();
         if quit_after {
             self.capture = None;
             std::process::exit(0);

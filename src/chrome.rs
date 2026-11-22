@@ -19,7 +19,7 @@ use crate::session::{
     group_sessions,
 };
 use crate::theme::{Rgb, UiColors};
-use crate::workspace::{PaneId, Rect as WsRect, Workspace};
+use crate::workspace::{DropTarget, PaneId, Rect as WsRect, SplitDir, Workspace};
 
 pub const TAB_BAR_HEIGHT: f32 = 30.0;
 pub const FOOTER_HEIGHT: f32 = 22.0;
@@ -45,6 +45,14 @@ pub enum UiAction {
     RemoveArchived(usize),
     /// New name for a session; empty restores the automatic name.
     RenameSession(SessionId, String),
+    /// A tab dropped somewhere else (drag and drop or the tab menu).
+    MoveTab(SessionId, DropTarget),
+    /// Opens a new session in a new pane beside `PaneId`.
+    SplitPane(PaneId, SplitDir),
+    /// A pane divider dragged: `delta` and `min` are shares of the split.
+    ResizeSplit { path: Vec<usize>, index: usize, delta: f32, min: f32 },
+    EqualizeSplits,
+    DismissError,
 }
 
 /// Sidebar UI state that persists across frames.
@@ -57,6 +65,24 @@ pub struct ChromeState {
     pub archived_open: bool,
     /// Session whose name is being edited inline (tab or sidebar card).
     pub renaming: Option<Renaming>,
+    /// Tab being dragged.
+    pub drag: Option<TabDrag>,
+}
+
+pub struct TabDrag {
+    pub session: SessionId,
+    pub pane: PaneId,
+    pub title: String,
+    pub icon: String,
+}
+
+/// Where a pane's tab bar, tabs and body were drawn this frame (drop
+/// targets for a dragged tab).
+struct PaneGeom {
+    pane: PaneId,
+    tab_bar: Rect,
+    tabs: Vec<Rect>,
+    body: Rect,
 }
 
 pub struct Renaming {
@@ -108,6 +134,7 @@ pub struct ChromeInput<'a> {
     pub scrolled: &'a [SessionId],
     pub new_session_shortcut: String,
     pub search_shortcut: String,
+    /// Error banner at the bottom of the sidebar (dismissible).
     pub error: Option<&'a str>,
 }
 
@@ -123,6 +150,9 @@ pub struct PaneView {
 pub struct ChromeOutput {
     pub actions: Vec<UiAction>,
     pub panes: Vec<PaneView>,
+    /// Grab areas of the pane dividers (egui points): clicks there aren't
+    /// terminal clicks.
+    pub dividers: Vec<Rect>,
 }
 
 /// Applies the theme's chrome palette and the terminal font to egui.
@@ -234,6 +264,12 @@ pub fn paint_icon(painter: &egui::Painter, center: Pos2, radius: f32, icon: &str
                 painter.rect_filled(bar, CornerRadius::same(1), color);
             }
         }
+        "split" => {
+            let r = Rect::from_center_size(center, Vec2::new(radius * 2.0, radius * 1.7));
+            let stroke = Stroke::new(1.2, color);
+            painter.rect_stroke(r, CornerRadius::same(2), stroke, StrokeKind::Inside);
+            painter.line_segment([Pos2::new(center.x, r.top()), Pos2::new(center.x, r.bottom())], stroke);
+        }
         "gear" => {
             let stroke = Stroke::new(1.3, color);
             for i in 0..8 {
@@ -296,7 +332,9 @@ pub fn draw(root: &mut egui::Ui, state: &mut ChromeState, input: &ChromeInput<'_
         }
         let ws_area = WsRect::new(area.left(), area.top(), area.width(), area.height());
         let order = input.workspace.pane_order();
-        for (pane_id, r) in input.workspace.layout(ws_area, PANE_GAP) {
+        let (layout, dividers) = input.workspace.layout_with_dividers(ws_area, PANE_GAP);
+        let mut geoms = Vec::new();
+        for (pane_id, r) in layout {
             let rect = Rect::from_min_size(Pos2::new(r.x, r.y), Vec2::new(r.w, r.h));
             // The top-left pane shares its row with the window controls when
             // the sidebar is hidden.
@@ -307,7 +345,7 @@ pub fn draw(root: &mut egui::Ui, state: &mut ChromeState, input: &ChromeInput<'_
                 0.0
             };
             let tabs = Rect::from_min_size(rect.min, Vec2::new(rect.width(), TAB_BAR_HEIGHT));
-            tab_bar(ui, state, pane_id, tabs, inset, input, &mut out);
+            let tab_rects = tab_bar(ui, state, pane_id, tabs, inset, input, &mut out);
             if inset > 0.0 {
                 let x = input.traffic_lights.map(|v| v.x).unwrap_or(0.0) + 2.0;
                 sidebar_toggle(ui, Rect::from_min_size(Pos2::new(rect.left() + x, rect.top() + 4.0), Vec2::splat(22.0)), colors, &mut out);
@@ -326,9 +364,120 @@ pub fn draw(root: &mut egui::Ui, state: &mut ChromeState, input: &ChromeInput<'_
                 }
             }
             out.panes.push(PaneView { pane: pane_id, session, terminal });
+            let body = Rect::from_min_max(Pos2::new(rect.left(), tabs.bottom()), rect.max);
+            geoms.push(PaneGeom { pane: pane_id, tab_bar: tabs, tabs: tab_rects, body });
         }
+        pane_dividers(ui, &dividers, colors, &mut out);
+        tab_drag(ui, state, &geoms, input, &mut out);
     });
     out
+}
+
+/// Drag a divider to resize the panes beside it; double-click evens out
+/// every split.
+fn pane_dividers(ui: &mut egui::Ui, dividers: &[crate::workspace::Divider], colors: &UiColors, out: &mut ChromeOutput) {
+    for d in dividers {
+        let line = Rect::from_min_size(Pos2::new(d.rect.x, d.rect.y), Vec2::new(d.rect.w, d.rect.h));
+        let (grab, cursor, min_px) = match d.dir {
+            SplitDir::Vertical => (line.expand2(Vec2::new(3.0, 0.0)), egui::CursorIcon::ResizeHorizontal, 120.0),
+            SplitDir::Horizontal => (line.expand2(Vec2::new(0.0, 3.0)), egui::CursorIcon::ResizeVertical, 70.0),
+        };
+        let resp = ui.interact(grab, ui.scope_id().with(("divider", &d.path, d.index)), Sense::click_and_drag());
+        if resp.hovered() || resp.dragged() {
+            ui.ctx().set_cursor_icon(cursor);
+            ui.painter().rect_filled(line.expand(0.5), CornerRadius::ZERO, c32(colors.accent).gamma_multiply(0.7));
+        }
+        if resp.dragged() && d.extent > 0.0 {
+            let delta = match d.dir {
+                SplitDir::Vertical => resp.drag_delta().x,
+                SplitDir::Horizontal => resp.drag_delta().y,
+            };
+            if delta != 0.0 {
+                out.actions.push(UiAction::ResizeSplit { path: d.path.clone(), index: d.index, delta: delta / d.extent, min: min_px / d.extent });
+            }
+        }
+        if resp.double_clicked() {
+            out.actions.push(UiAction::EqualizeSplits);
+        }
+        out.dividers.push(grab);
+    }
+}
+
+/// Where a tab dropped at `pos` would go, and the area to highlight.
+/// Tab bars insert at the nearest gap; the edges of a pane's body split it,
+/// its center moves the tab into that pane.
+fn drop_target(geoms: &[PaneGeom], pos: Pos2, from: PaneId, from_len: usize) -> Option<(DropTarget, Rect)> {
+    let g = geoms.iter().find(|g| g.tab_bar.contains(pos) || g.body.contains(pos))?;
+    if g.tab_bar.contains(pos) {
+        let index = g.tabs.iter().filter(|t| t.center().x < pos.x).count();
+        let x = match (index.checked_sub(1).and_then(|i| g.tabs.get(i)), g.tabs.get(index)) {
+            (_, Some(next)) => next.left(),
+            (Some(prev), None) => prev.right(),
+            (None, None) => g.tab_bar.left(),
+        };
+        let marker = Rect::from_min_max(Pos2::new(x - 1.0, g.tab_bar.top() + 5.0), Pos2::new(x + 1.0, g.tab_bar.bottom() - 3.0));
+        return Some((DropTarget::Tab { pane: g.pane, index }, marker));
+    }
+    let b = g.body;
+    let fx = (pos.x - b.left()) / b.width().max(1.0);
+    let fy = (pos.y - b.top()) / b.height().max(1.0);
+    let edges = [
+        (fx, SplitDir::Vertical, true),
+        (1.0 - fx, SplitDir::Vertical, false),
+        (fy, SplitDir::Horizontal, true),
+        (1.0 - fy, SplitDir::Horizontal, false),
+    ];
+    let (dist, dir, before) = edges.into_iter().min_by(|a, b| a.0.total_cmp(&b.0))?;
+    if dist < 0.25 {
+        if g.pane == from && from_len <= 1 {
+            return None;
+        }
+        let half = match (dir, before) {
+            (SplitDir::Vertical, true) => Rect::from_min_max(b.min, Pos2::new(b.center().x, b.bottom())),
+            (SplitDir::Vertical, false) => Rect::from_min_max(Pos2::new(b.center().x, b.top()), b.max),
+            (SplitDir::Horizontal, true) => Rect::from_min_max(b.min, Pos2::new(b.right(), b.center().y)),
+            (SplitDir::Horizontal, false) => Rect::from_min_max(Pos2::new(b.left(), b.center().y), b.max),
+        };
+        return Some((DropTarget::Split { pane: g.pane, dir, before }, half));
+    }
+    if g.pane == from {
+        return None;
+    }
+    Some((DropTarget::Tab { pane: g.pane, index: g.tabs.len() }, b))
+}
+
+/// Follows a dragged tab: highlights where it would land and drops it on
+/// release (anywhere else cancels).
+fn tab_drag(ui: &mut egui::Ui, state: &mut ChromeState, geoms: &[PaneGeom], input: &ChromeInput<'_>, out: &mut ChromeOutput) {
+    let Some(drag) = &state.drag else { return };
+    let colors = input.colors;
+    let from_len = input.workspace.pane(drag.pane).map_or(0, |p| p.tabs.len());
+    let pos = ui.ctx().pointer_latest_pos();
+    let target = pos.and_then(|pos| drop_target(geoms, pos, drag.pane, from_len));
+    if !ui.input(|i| i.pointer.primary_down()) {
+        if let Some((target, _)) = target {
+            out.actions.push(UiAction::MoveTab(drag.session, target));
+        }
+        state.drag = None;
+        ui.ctx().request_repaint();
+        return;
+    }
+    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    let p = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, ui.scope_id().with("tab-drag")));
+    let accent = c32(colors.accent);
+    if let Some((_, area)) = target {
+        p.rect(area, CornerRadius::same(4), accent.gamma_multiply(0.15), Stroke::new(1.5, accent), StrokeKind::Inside);
+    }
+    if let Some(pos) = pos {
+        let galley = p.layout_no_wrap(drag.title.clone(), FontId::proportional(12.0), c32(colors.text_primary));
+        let size = Vec2::new((galley.size().x + 34.0).min(220.0), 24.0);
+        let ghost = Rect::from_min_size(pos + Vec2::new(10.0, 8.0), size);
+        p.rect(ghost, CornerRadius::same(6), c32(colors.pill_selected_background), Stroke::new(1.0, c32(colors.border)), StrokeKind::Inside);
+        paint_icon(&p, Pos2::new(ghost.left() + 13.0, ghost.center().y), 5.5, &drag.icon, c32(colors.text_primary));
+        let text_pos = Pos2::new(ghost.left() + 25.0, ghost.center().y - galley.size().y / 2.0);
+        p.with_clip_rect(ghost.shrink(2.0)).galley(text_pos, galley, c32(colors.text_primary));
+    }
+    ui.ctx().request_repaint();
 }
 
 fn sidebar(ui: &mut egui::Ui, state: &mut ChromeState, input: &ChromeInput<'_>, out: &mut ChromeOutput) {
@@ -418,8 +567,18 @@ fn sidebar(ui: &mut egui::Ui, state: &mut ChromeState, input: &ChromeInput<'_>, 
     });
     ui.add_space(6.0);
 
-    // Footer: error banner, agent launcher, archived + settings.
-    let footer_h = 76.0 + if input.error.is_some() { 48.0 } else { 0.0 };
+    // Footer: error banner, agent launcher, archived + settings. The banner
+    // is measured (at most a few lines, the rest on hover) so it never
+    // pushes the buttons below it off the window.
+    let banner = input.error.map(|error| {
+        let wrap = (full.width() - 12.0 - 18.0).max(40.0);
+        let mut job = egui::text::LayoutJob::simple(error.to_owned(), FontId::proportional(10.5), c32(colors.text_primary), wrap);
+        job.wrap.max_rows = 4;
+        job.wrap.break_anywhere = true;
+        ui.painter().layout_job(job)
+    });
+    let banner_h = banner.as_ref().map_or(0.0, |g| g.size().y + 12.0);
+    let footer_h = 76.0 + if banner.is_some() { banner_h + 4.0 } else { 0.0 };
     let list_h = (ui.available_height() - footer_h).max(0.0);
     let focused = input.workspace.focused_session();
 
@@ -446,14 +605,24 @@ fn sidebar(ui: &mut egui::Ui, state: &mut ChromeState, input: &ChromeInput<'_>, 
 
     let bottom = Rect::from_min_max(Pos2::new(full.left(), full.bottom() - footer_h), full.max);
     let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(bottom));
-    if let Some(error) = input.error {
-        egui::Frame::new()
-            .fill(c32(colors.diff_delete_background))
-            .corner_radius(CornerRadius::same(6))
-            .inner_margin(egui::Margin::same(6))
-            .show(&mut ui, |ui| {
-                ui.label(egui::RichText::new(format!("config.toml: {error}")).size(10.5).color(c32(colors.text_primary)));
-            });
+    if let (Some(error), Some(galley)) = (input.error, banner) {
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), banner_h), Sense::hover());
+        let p = ui.painter();
+        p.rect_filled(rect, CornerRadius::same(6), c32(colors.diff_delete_background));
+        let elided = galley.elided;
+        p.galley(rect.min + Vec2::splat(6.0), galley, c32(colors.text_primary));
+        if elided {
+            resp.on_hover_text(error);
+        }
+        let close = Rect::from_center_size(Pos2::new(rect.right() - 11.0, rect.top() + 11.0), Vec2::splat(16.0));
+        let close_resp = ui.interact(close, ui.scope_id().with("dismiss-error"), Sense::click());
+        if close_resp.hovered() {
+            ui.painter().rect_filled(close, CornerRadius::same(4), c32(colors.button_background));
+        }
+        paint_icon(ui.painter(), close.center(), 6.0, "close", c32(if close_resp.hovered() { colors.text_primary } else { colors.text_dim }));
+        if close_resp.on_hover_text("Dismiss").clicked() {
+            out.actions.push(UiAction::DismissError);
+        }
         ui.add_space(4.0);
     }
     ui.horizontal(|ui| {
@@ -591,11 +760,11 @@ fn session_card(ui: &mut egui::Ui, state: &mut ChromeState, s: &SessionSummary, 
     } else if resp.clicked() {
         out.actions.push(UiAction::FocusSession(s.id));
     }
-    resp.context_menu(|ui| session_menu(ui, state, s.id, s.title.clone(), s.renamed, out));
+    resp.context_menu(|ui| session_menu(ui, state, s.id, s.title.clone(), s.renamed, input.workspace, out));
 }
 
 /// Right-click menu shared by tabs and sidebar cards.
-fn session_menu(ui: &mut egui::Ui, state: &mut ChromeState, id: SessionId, current: String, renamed: bool, out: &mut ChromeOutput) {
+fn session_menu(ui: &mut egui::Ui, state: &mut ChromeState, id: SessionId, current: String, renamed: bool, workspace: &Workspace, out: &mut ChromeOutput) {
     if id != USAGE_TAB {
         if ui.button("Rename…").clicked() {
             state.start_rename(id, current);
@@ -604,6 +773,16 @@ fn session_menu(ui: &mut egui::Ui, state: &mut ChromeState, id: SessionId, curre
         if renamed && ui.button("Reset name").clicked() {
             out.actions.push(UiAction::RenameSession(id, String::new()));
             ui.close();
+        }
+        ui.separator();
+    }
+    // A pane's only tab can't be split off from itself.
+    if let Some(pane) = workspace.pane_of(id).filter(|p| workspace.pane(*p).is_some_and(|p| p.tabs.len() > 1)) {
+        for (label, dir) in [("Move to split right", SplitDir::Vertical), ("Move to split down", SplitDir::Horizontal)] {
+            if ui.button(label).clicked() {
+                out.actions.push(UiAction::MoveTab(id, DropTarget::Split { pane, dir, before: false }));
+                ui.close();
+            }
         }
         ui.separator();
     }
@@ -643,9 +822,11 @@ fn rename_field(ui: &mut egui::Ui, state: &mut ChromeState, id: SessionId, rect:
     true
 }
 
-fn tab_bar(ui: &mut egui::Ui, state: &mut ChromeState, pane_id: PaneId, rect: Rect, inset: f32, input: &ChromeInput<'_>, out: &mut ChromeOutput) {
+/// Draws a pane's tab bar; returns where each tab went.
+fn tab_bar(ui: &mut egui::Ui, state: &mut ChromeState, pane_id: PaneId, rect: Rect, inset: f32, input: &ChromeInput<'_>, out: &mut ChromeOutput) -> Vec<Rect> {
     let colors = input.colors;
-    let Some(pane) = input.workspace.pane(pane_id) else { return };
+    let Some(pane) = input.workspace.pane(pane_id) else { return Vec::new() };
+    let mut tab_rects = Vec::with_capacity(pane.tabs.len());
     let focused_pane = input.workspace.focused_pane() == Some(pane_id);
     ui.painter().rect_filled(rect, CornerRadius::ZERO, c32(colors.chrome_background));
 
@@ -659,7 +840,8 @@ fn tab_bar(ui: &mut egui::Ui, state: &mut ChromeState, pane_id: PaneId, rect: Re
     let radius = input.tab_radius.round().clamp(0.0, 14.0) as u8;
     let accent = if focused_pane { colors.accent } else { colors.text_dim };
     let plus_w = 28.0;
-    let avail = (rect.width() - inset - plus_w).max(0.0);
+    let split_w = 28.0;
+    let avail = (rect.width() - inset - plus_w - split_w).max(0.0);
     let tab_w = (avail / pane.tabs.len().max(1) as f32).clamp(60.0, input.tab_max_width.max(60.0));
     // Rounded tabs start lower, so their content sits a bit lower too.
     let dy = if style == TabStyle::Rounded { 2.5 } else { 0.0 };
@@ -667,10 +849,12 @@ fn tab_bar(ui: &mut egui::Ui, state: &mut ChromeState, pane_id: PaneId, rect: Re
     for (index, sid) in pane.tabs.iter().enumerate() {
         let tab = Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(tab_w, rect.height()));
         x += tab_w;
+        tab_rects.push(tab);
         let summary = input.summaries.iter().find(|s| s.id == *sid);
         let active = index == pane.active;
-        let resp = ui.interact(tab, ui.scope_id().with(("tab", pane_id, *sid)), Sense::click());
-        let hovered = resp.hovered();
+        let resp = ui.interact(tab, ui.scope_id().with(("tab", pane_id, *sid)), Sense::click_and_drag());
+        let dragging = state.drag.as_ref().is_some_and(|d| d.session == *sid);
+        let hovered = resp.hovered() && state.drag.is_none();
         let p = ui.painter();
 
         match style {
@@ -759,17 +943,25 @@ fn tab_bar(ui: &mut egui::Ui, state: &mut ChromeState, pane_id: PaneId, rect: Re
             p.line_segment([close.center() + Vec2::new(-k, -k), close.center() + Vec2::new(k, k)], Stroke::new(1.2, c32(c)));
             p.line_segment([close.center() + Vec2::new(k, -k), close.center() + Vec2::new(-k, k)], Stroke::new(1.2, c32(c)));
         }
-        if close_resp.clicked() {
+        if dragging {
+            // Where the dragged tab was, until it lands.
+            ui.painter().rect_filled(tab.shrink2(Vec2::new(2.0, 4.0)), CornerRadius::same(4), c32(colors.chrome_background).gamma_multiply(0.6));
+        }
+        if resp.drag_started_by(egui::PointerButton::Primary) && !editing {
+            state.drag = Some(TabDrag { session: *sid, pane: pane_id, title: title.clone(), icon: icon.to_owned() });
+        }
+        // Middle click closes, as in a browser.
+        if close_resp.clicked() || resp.middle_clicked() || close_resp.middle_clicked() {
             out.actions.push(UiAction::CloseSession(*sid));
         } else if resp.double_clicked() {
             state.start_rename(*sid, title.clone());
         } else if resp.clicked() {
             out.actions.push(UiAction::ActivateTab(pane_id, index));
         }
-        resp.context_menu(|ui| session_menu(ui, state, *sid, title.clone(), renamed, out));
+        resp.context_menu(|ui| session_menu(ui, state, *sid, title.clone(), renamed, input.workspace, out));
     }
 
-    let plus = Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(plus_w, rect.height()));
+    let plus =Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(plus_w, rect.height()));
     let resp = ui.interact(plus, ui.scope_id().with(("plus", pane_id)), Sense::click());
     let c = if resp.hovered() { colors.text_primary } else { colors.text_dim };
     let plus_center = plus.center() + Vec2::new(0.0, dy);
@@ -780,6 +972,21 @@ fn tab_bar(ui: &mut egui::Ui, state: &mut ChromeState, pane_id: PaneId, rect: Re
     if resp.on_hover_text("New tab").clicked() {
         out.actions.push(UiAction::NewTab(pane_id));
     }
+
+    // Split button at the right end of the bar.
+    let split = Rect::from_min_size(Pos2::new(rect.right() - split_w, rect.top()), Vec2::new(split_w, rect.height()));
+    let resp = ui.interact(split, ui.scope_id().with(("split", pane_id)), Sense::click());
+    let c = if resp.hovered() { colors.text_primary } else { colors.text_dim };
+    let split_center = split.center() + Vec2::new(0.0, dy);
+    if resp.hovered() {
+        ui.painter().rect_filled(Rect::from_center_size(split_center, Vec2::splat(20.0)), CornerRadius::same(radius.min(10)), c32(colors.button_background));
+    }
+    paint_icon(ui.painter(), split_center, 6.0, "split", c32(c));
+    if resp.on_hover_text("Split right (Shift+click: split down)").clicked() {
+        let dir = if ui.input(|i| i.modifiers.shift) { SplitDir::Horizontal } else { SplitDir::Vertical };
+        out.actions.push(UiAction::SplitPane(pane_id, dir));
+    }
+    tab_rects
 }
 
 /// `● Working · claude-opus-4-5 · 139.5k tokens        week ━━━── 15% ↻ 5d 11h`
