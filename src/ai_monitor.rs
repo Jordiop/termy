@@ -108,6 +108,9 @@ pub struct UsageRecord {
     pub dedupe_key: Option<String>,
     /// `usage` is the session's running total, not a delta.
     pub cumulative: bool,
+    /// Running total of model calls in the session, when the log states it
+    /// (Gemini). Otherwise each new call counts as one turn.
+    pub turns: Option<u32>,
 }
 
 /// Aggregated usage of one agent session (one Claude/Codex/Gemini session id).
@@ -118,16 +121,30 @@ pub struct SessionUsage {
     pub cwd: Option<PathBuf>,
     pub model: Option<String>,
     pub usage: TokenUsage,
+    /// Model calls ("turns").
+    pub turns: u64,
     pub first_ms: u64,
     pub last_ms: u64,
+    /// Index referenced by [`UsageEvent::session`].
+    idx: u32,
     last_cumulative: TokenUsage,
+    last_cumulative_turns: u32,
 }
 
-#[derive(Clone, Debug)]
-struct UsageEvent {
-    agent: String,
-    ts_ms: u64,
-    usage: TokenUsage,
+/// Sentinel for "no model known" in [`UsageEvent::model`].
+pub const NO_MODEL: u16 = u16::MAX;
+
+/// One increment of usage, kept for time-based views (budgets, dashboard).
+/// Names are interned in the store: see [`UsageStore::name`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UsageEvent {
+    pub agent: u16,
+    pub model: u16,
+    pub session: u32,
+    pub ts_ms: u64,
+    pub usage: TokenUsage,
+    /// New model calls in this increment.
+    pub turns: u32,
 }
 
 /// Reported by a `kind = "command"` source.
@@ -176,35 +193,62 @@ pub struct UsageStore {
     events: Vec<UsageEvent>,
     seen: HashMap<String, TokenUsage>,
     quotas: HashMap<String, QuotaReport>,
+    /// Interned agent and model names (indices in [`UsageEvent`]).
+    names: Vec<String>,
+    name_ids: HashMap<String, u16>,
+    /// Bumped on every change, so views can cache what they derive.
+    generation: u64,
+    /// How many days of logs have been scanned (`u32::MAX` = everything).
+    history_days: u32,
+    /// A deeper history scan is running.
+    loading: bool,
 }
 
 impl UsageStore {
     pub fn ingest(&mut self, agent: &str, record: UsageRecord, now_ms: u64) {
         let ts = record.timestamp_ms.unwrap_or(now_ms);
         let key = (agent.to_owned(), record.session_id.clone());
+        let next_idx = self.sessions.len() as u32;
         let session = self.sessions.entry(key).or_insert_with(|| SessionUsage {
             agent: agent.to_owned(),
             session_id: record.session_id.clone(),
             first_ms: ts,
             last_ms: ts,
+            idx: next_idx,
             ..Default::default()
         });
 
+        let new_call;
         let delta = if record.cumulative {
             let prev = session.last_cumulative;
             session.last_cumulative = record.usage;
-            if record.usage.regressed_from(&prev) { record.usage } else { record.usage.saturating_sub(prev) }
+            let delta = if record.usage.regressed_from(&prev) { record.usage } else { record.usage.saturating_sub(prev) };
+            new_call = !delta.is_zero();
+            delta
         } else if let Some(dedupe) = record.dedupe_key.as_ref().map(|k| format!("{agent}\0{k}")) {
             // Streaming logs repeat a call's usage on every content block,
             // sometimes growing: count only what's new.
-            let prev = self.seen.get(&dedupe).copied().unwrap_or_default();
+            let prev = self.seen.get(&dedupe).copied();
+            // Zero-usage entries (e.g. `<synthetic>` messages) aren't calls.
+            new_call = prev.is_none() && !record.usage.is_zero();
+            let prev = prev.unwrap_or_default();
             self.seen.insert(dedupe, prev.max(record.usage));
             record.usage.saturating_sub(prev)
         } else {
+            new_call = !record.usage.is_zero();
             record.usage
+        };
+        let turns = match record.turns {
+            Some(total) => {
+                let prev = session.last_cumulative_turns;
+                session.last_cumulative_turns = total;
+                if total < prev { total } else { total - prev }
+            }
+            None => new_call as u32,
         };
 
         session.usage += delta;
+        session.turns += turns as u64;
         session.first_ms = session.first_ms.min(ts);
         session.last_ms = session.last_ms.max(ts);
         if record.cwd.is_some() {
@@ -213,19 +257,67 @@ impl UsageStore {
         if let Some(model) = record.model.filter(|m| !m.starts_with('<')) {
             session.model = Some(model);
         }
-        if !delta.is_zero() {
-            self.events.push(UsageEvent { agent: agent.to_owned(), ts_ms: ts, usage: delta });
+        if !delta.is_zero() || turns > 0 {
+            let (session, model) = (session.idx, session.model.clone());
+            let agent = self.intern(agent);
+            let model = model.map_or(NO_MODEL, |m| self.intern(&m));
+            self.events.push(UsageEvent { agent, model, session, ts_ms: ts, usage: delta, turns });
         }
+        self.generation += 1;
+    }
+
+    fn intern(&mut self, name: &str) -> u16 {
+        if let Some(&id) = self.name_ids.get(name) {
+            return id;
+        }
+        // NO_MODEL is reserved; past that many names, lump the rest together.
+        let id = (self.names.len() as u16).min(NO_MODEL - 1);
+        if (id as usize) == self.names.len() {
+            self.names.push(name.to_owned());
+        }
+        self.name_ids.insert(name.to_owned(), id);
+        id
+    }
+
+    pub fn name_id(&self, name: &str) -> Option<u16> {
+        self.name_ids.get(name).copied()
+    }
+
+    /// An interned agent or model name.
+    pub fn name(&self, id: u16) -> &str {
+        self.names.get(id as usize).map_or("", String::as_str)
+    }
+
+    pub fn events(&self) -> &[UsageEvent] {
+        &self.events
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[cfg(test)]
+    pub fn history_days(&self) -> u32 {
+        self.history_days
+    }
+
+    pub fn is_loading(&self) -> bool {
+        self.loading
     }
 
     pub fn set_quota(&mut self, agent: &str, report: QuotaReport) {
         self.quotas.insert(agent.to_owned(), report);
+        self.generation += 1;
     }
 
     /// Drops per-event history older than `keep_ms` (session totals stay).
     pub fn prune(&mut self, now_ms: u64, keep_ms: u64) {
         let cutoff = now_ms.saturating_sub(keep_ms);
+        let before = self.events.len();
         self.events.retain(|e| e.ts_ms >= cutoff);
+        if self.events.len() != before {
+            self.generation += 1;
+        }
     }
 
     #[cfg(test)]
@@ -251,6 +343,7 @@ impl UsageStore {
     /// Sum of usage in `[from_ms, to_ms)`.
     pub fn usage_between(&self, agent: &str, from_ms: u64, to_ms: u64) -> TokenUsage {
         let mut total = TokenUsage::default();
+        let Some(agent) = self.name_id(agent) else { return total };
         for e in self.events.iter().filter(|e| e.agent == agent && e.ts_ms >= from_ms && e.ts_ms < to_ms) {
             total += e.usage;
         }
@@ -268,10 +361,11 @@ impl UsageStore {
             }
             WeeklyWindow::Rolling => {
                 let from = now_ms.saturating_sub(WEEK_MS);
+                let agent = self.name_id(&profile.name);
                 let oldest = self
                     .events
                     .iter()
-                    .filter(|e| e.agent == profile.name && e.ts_ms >= from)
+                    .filter(|e| Some(e.agent) == agent && e.ts_ms >= from)
                     .map(|e| e.ts_ms)
                     .min();
                 (from, oldest.map(|t| t + WEEK_MS))
@@ -370,12 +464,13 @@ impl WeeklyReset {
     }
 }
 
-/// `950`, `12.3k`, `139.5k`, `1.2M`.
+/// `950`, `12.3k`, `139.5k`, `1.2M`, `11.6B`.
 pub fn format_tokens(n: u64) -> String {
     match n {
         0..1_000 => n.to_string(),
         1_000..1_000_000 => format!("{:.1}k", n as f64 / 1e3).replace(".0k", "k"),
-        _ => format!("{:.1}M", n as f64 / 1e6).replace(".0M", "M"),
+        1_000_000..1_000_000_000 => format!("{:.1}M", n as f64 / 1e6).replace(".0M", "M"),
+        _ => format!("{:.1}B", n as f64 / 1e9).replace(".0B", "B"),
     }
 }
 
@@ -480,6 +575,7 @@ pub fn parse_claude_line(line: &str, path: &Path) -> Option<UsageRecord> {
         },
         dedupe_key,
         cumulative: false,
+        turns: None,
     })
 }
 
@@ -522,6 +618,7 @@ pub fn parse_codex_line(line: &str, path: &Path, ctx: &mut CodexContext) -> Opti
                 },
                 dedupe_key: None,
                 cumulative: true,
+                turns: None,
             })
         }
         _ => None,
@@ -534,8 +631,10 @@ pub fn parse_gemini_chat(text: &str, path: &Path) -> Option<UsageRecord> {
     let mut usage = TokenUsage::default();
     let mut model = None;
     let mut last_ts = None;
+    let mut turns = 0u32;
     for msg in v.get("messages")?.as_array()? {
         let Some(tokens) = msg.get("tokens") else { continue };
+        turns += 1;
         let input = u64_at(tokens, "/input");
         let cached = u64_at(tokens, "/cached");
         usage += TokenUsage {
@@ -555,6 +654,7 @@ pub fn parse_gemini_chat(text: &str, path: &Path) -> Option<UsageRecord> {
         usage,
         dedupe_key: None,
         cumulative: true,
+        turns: Some(turns),
     })
 }
 
@@ -583,6 +683,7 @@ pub fn parse_generic_line(line: &str, path: &Path, spec: &JsonlSource) -> Option
         },
         dedupe_key: opt_str(&spec.dedupe_key),
         cumulative: spec.cumulative,
+        turns: None,
     })
 }
 
@@ -793,9 +894,10 @@ impl Ingestor {
         true
     }
 
-    /// Initial pass over files modified in the last `days` days.
+    /// Pass over files modified in the last `days` days (`u32::MAX` = all).
+    /// Files already read are only read from where they were left.
     fn scan(&mut self, days: u32, store: &RwLock<UsageStore>) {
-        let cutoff = SystemTime::now() - Duration::from_secs(days as u64 * 86_400);
+        let cutoff = SystemTime::now().checked_sub(Duration::from_secs(days as u64 * 86_400)).unwrap_or(UNIX_EPOCH);
         let mut files = Vec::new();
         for source in &self.sources {
             collect_files(&source.root, 6, &mut |p, modified| {
@@ -860,6 +962,8 @@ fn run_quota_command(cmd: &CommandSource, timeout: Duration) -> Option<QuotaRepo
 enum Msg {
     Fs(notify::Event),
     Reconfigure(Vec<AgentProfile>, u32),
+    /// Scan this many days back (`u32::MAX` = everything).
+    LoadHistory(u32),
     Shutdown,
 }
 
@@ -893,6 +997,20 @@ impl AiMonitor {
         let agents = if config.monitor.enabled { config.agents.clone() } else { Vec::new() };
         let _ = self.tx.send(Msg::Reconfigure(agents, config.monitor.scan_days));
     }
+
+    /// Makes sure at least `days` days of logs are loaded (`u32::MAX` = all),
+    /// scanning older files in the background. Returns immediately; the
+    /// store reports [`UsageStore::is_loading`] until the scan is done.
+    pub fn load_history(&self, days: u32) {
+        let mut store = self.store.write();
+        if days <= store.history_days || store.loading {
+            return;
+        }
+        store.loading = true;
+        store.generation += 1;
+        drop(store);
+        let _ = self.tx.send(Msg::LoadHistory(days));
+    }
 }
 
 impl Drop for AiMonitor {
@@ -914,6 +1032,8 @@ fn worker(
 ) {
     let mut state = WorkerState::setup(&agents, scan_days, &store, &tx);
     wake();
+    // Deepest history asked for by a view; survives reconfiguration.
+    let mut requested_days = 0;
     let mut last_prune = Instant::now();
     let mut last_poll = Instant::now();
     let mut pending: Option<Msg> = None;
@@ -928,7 +1048,18 @@ fn worker(
             Ok(Msg::Shutdown) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
             Ok(Msg::Reconfigure(agents, days)) => {
                 *store.write() = UsageStore::default();
-                state = WorkerState::setup(&agents, days, &store, &tx);
+                state = WorkerState::setup(&agents, days.max(requested_days), &store, &tx);
+                changed = true;
+            }
+            Ok(Msg::LoadHistory(days)) => {
+                requested_days = requested_days.max(days);
+                if days > store.read().history_days {
+                    state.ingestor.scan(days, &store);
+                }
+                let mut s = store.write();
+                s.history_days = s.history_days.max(days);
+                s.loading = false;
+                s.generation += 1;
                 changed = true;
             }
             Ok(Msg::Fs(event)) => {
@@ -957,7 +1088,10 @@ fn worker(
         }
         changed |= state.run_due_commands(&store);
         if last_prune.elapsed() > Duration::from_secs(3600) {
-            store.write().prune(now_ms(), 8 * DAY_MS);
+            let mut s = store.write();
+            let keep_days = s.history_days.max(8);
+            s.prune(now_ms(), (keep_days as u64).saturating_mul(DAY_MS));
+            drop(s);
             last_prune = Instant::now();
         }
         if changed {
@@ -1002,6 +1136,10 @@ impl WorkerState {
         };
         let mut ingestor = Ingestor::new(logs);
         ingestor.scan(scan_days, store);
+        let mut s = store.write();
+        s.history_days = scan_days;
+        s.generation += 1;
+        drop(s);
         let now = Instant::now();
         Self { ingestor, commands: commands.into_iter().map(|c| (c, now)).collect(), _watcher: watcher }
     }
@@ -1101,6 +1239,34 @@ mod tests {
     }
 
     #[test]
+    fn turns_count_model_calls_once() {
+        let path = Path::new("/x/session.jsonl");
+        let mut store = UsageStore::default();
+        for _ in 0..2 {
+            ingest_lines(&mut store, "Claude Code", CLAUDE_FIXTURE, |l| parse_claude_line(l, path));
+        }
+        // msg_01A (streamed twice) + msg_01B; the zero-usage <synthetic> isn't a call.
+        assert_eq!(store.session("Claude Code", CLAUDE_SESSION).unwrap().turns, 2);
+        let events = store.events();
+        assert_eq!(events.iter().map(|e| e.turns).sum::<u32>(), 2);
+        assert!(events.iter().all(|e| store.name(e.agent) == "Claude Code"));
+        assert!(events.iter().all(|e| store.name(e.model) == "claude-opus-4-5"));
+
+        let mut ctx = CodexContext::default();
+        let codex = Path::new("/x/rollout.jsonl");
+        ingest_lines(&mut store, "Codex", CODEX_FIXTURE, |l| parse_codex_line(l, codex, &mut ctx));
+        assert_eq!(store.session("Codex", "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b").unwrap().turns, 2);
+
+        // Gemini states its running total; re-reading the file adds nothing.
+        let r = parse_gemini_chat(GEMINI_FIXTURE, Path::new("/x/chats/s.json")).unwrap();
+        assert_eq!(r.turns, Some(2));
+        store.ingest("Gemini CLI", r.clone(), 0);
+        store.ingest("Gemini CLI", r, 0);
+        assert_eq!(store.session("Gemini CLI", "b7c8d9e0-1f2a-4b3c-8d4e-5f6a7b8c9d0e").unwrap().turns, 2);
+        assert_eq!(store.name(NO_MODEL), "");
+    }
+
+    #[test]
     fn generic_jsonl_with_pointers() {
         let spec = JsonlSource {
             path: "~/logs".into(),
@@ -1133,6 +1299,8 @@ mod tests {
         assert_eq!(format_tokens(139_500), "139.5k");
         assert_eq!(format_tokens(2_000), "2k");
         assert_eq!(format_tokens(1_250_000), "1.2M");
+        assert_eq!(format_tokens(11_600_000_000), "11.6B");
+        assert_eq!(format_tokens(3_000_000_000), "3B");
         assert_eq!(format_reset(30_000), "<1m");
         assert_eq!(format_reset(45 * MINUTE_MS), "45m");
         assert_eq!(format_reset(200 * MINUTE_MS), "3h 20m");
@@ -1295,6 +1463,54 @@ mod tests {
         }
         assert_eq!(codex(&monitor), Some(900));
         assert!(output(&monitor).is_none(), "old data is dropped on reconfigure");
+    }
+
+    #[test]
+    fn history_is_loaded_on_demand_without_double_counting() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("claude-projects");
+        let project = root.join("-Users-dev-midterm");
+        std::fs::create_dir_all(&project).unwrap();
+        let old = project.join("old.jsonl");
+        std::fs::write(&old, CLAUDE_FIXTURE).unwrap();
+        // Last written 40 days ago: outside the startup scan.
+        let forty_days_ago = SystemTime::now() - Duration::from_secs(40 * 86_400);
+        std::fs::File::options().write(true).open(&old).unwrap().set_modified(forty_days_ago).unwrap();
+
+        let mut config = AppConfig::with_defaults();
+        config.agents.truncate(1);
+        config.agents[0].metrics = MetricsSource::ClaudeCode { path: root.to_string_lossy().into_owned() };
+        config.monitor.scan_days = 8;
+        let (wake_tx, wake_rx) = crossbeam_channel::unbounded();
+        let monitor = AiMonitor::start(&config, Arc::new(move || {
+            let _ = wake_tx.send(());
+        }));
+        let wait = |done: &dyn Fn(&UsageStore) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done(&monitor.store().read()) && Instant::now() < deadline {
+                let _ = wake_rx.recv_timeout(Duration::from_millis(100));
+            }
+            assert!(done(&monitor.store().read()));
+        };
+        wait(&|s| s.history_days() == 8);
+        assert!(monitor.store().read().session("Claude Code", CLAUDE_SESSION).is_none());
+
+        monitor.load_history(30); // not deep enough
+        wait(&|s| s.history_days() == 30 && !s.is_loading());
+        assert!(monitor.store().read().session("Claude Code", CLAUDE_SESSION).is_none());
+
+        monitor.load_history(u32::MAX);
+        wait(&|s| s.history_days() == u32::MAX && !s.is_loading());
+        let output = || monitor.store().read().session("Claude Code", CLAUDE_SESSION).map(|s| s.usage.output);
+        assert_eq!(output(), Some(470));
+
+        // Asking again (or for less) changes nothing.
+        let generation = monitor.store().read().generation();
+        monitor.load_history(u32::MAX);
+        monitor.load_history(90);
+        assert!(!monitor.store().read().is_loading());
+        assert_eq!(monitor.store().read().generation(), generation);
+        assert_eq!(output(), Some(470));
     }
 
     #[cfg(unix)]
