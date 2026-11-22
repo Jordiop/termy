@@ -434,6 +434,7 @@ pub enum Action {
     ToggleSidebar,
     SearchSessions,
     ToggleSettings,
+    OpenUsage,
     IncreaseFont,
     DecreaseFont,
     ResetFont,
@@ -441,7 +442,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 16] = [
+    pub const ALL: [Action; 17] = [
         Action::Copy,
         Action::Paste,
         Action::NewSession,
@@ -454,6 +455,7 @@ impl Action {
         Action::ToggleSidebar,
         Action::SearchSessions,
         Action::ToggleSettings,
+        Action::OpenUsage,
         Action::IncreaseFont,
         Action::DecreaseFont,
         Action::ResetFont,
@@ -474,6 +476,7 @@ impl Action {
             Action::ToggleSidebar => "Toggle sidebar",
             Action::SearchSessions => "Search sessions",
             Action::ToggleSettings => "Settings",
+            Action::OpenUsage => "Usage dashboard",
             Action::IncreaseFont => "Increase font size",
             Action::DecreaseFont => "Decrease font size",
             Action::ResetFont => "Reset font size",
@@ -498,6 +501,7 @@ impl Action {
             Action::ToggleSidebar => if mac { "cmd+b" } else { "ctrl+shift+b" },
             Action::SearchSessions => if mac { "cmd+k" } else { "ctrl+shift+k" },
             Action::ToggleSettings => if mac { "cmd+comma" } else { "ctrl+comma" },
+            Action::OpenUsage => if mac { "cmd+shift+u" } else { "ctrl+shift+u" },
             Action::IncreaseFont => if mac { "cmd+equal" } else { "ctrl+equal" },
             Action::DecreaseFont => if mac { "cmd+minus" } else { "ctrl+minus" },
             Action::ResetFont => if mac { "cmd+0" } else { "ctrl+0" },

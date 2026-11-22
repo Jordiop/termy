@@ -15,7 +15,8 @@ use crate::ai_monitor::{Gauge, format_reset, format_tokens};
 use crate::config::{AgentProfile, ResourcesConfig, TabStyle};
 use crate::resources::{ResourceUsage, format_bytes, format_cpu};
 use crate::session::{
-    ActivityState, ArchivedSession, SessionFilter, SessionId, SessionSummary, filter_counts, format_elapsed, group_sessions,
+    ActivityState, ArchivedSession, SessionFilter, SessionId, SessionSummary, USAGE_TAB, filter_counts, format_elapsed,
+    group_sessions,
 };
 use crate::theme::{Rgb, UiColors};
 use crate::workspace::{PaneId, Rect as WsRect, Workspace};
@@ -39,6 +40,7 @@ pub enum UiAction {
     JumpToBottom(SessionId),
     DragWindow,
     OpenSettings,
+    OpenUsage,
     RestoreArchived(usize),
     RemoveArchived(usize),
 }
@@ -195,6 +197,22 @@ pub fn paint_icon(painter: &egui::Painter, center: Pos2, radius: f32, icon: &str
             painter.rect_stroke(body, CornerRadius::same(1), stroke, StrokeKind::Inside);
             painter.line_segment([Pos2::new(center.x - radius * 0.3, body.top() + 3.0), Pos2::new(center.x + radius * 0.3, body.top() + 3.0)], stroke);
         }
+        "close" => {
+            // Drawn, not "✕": the terminal font egui uses may not have it.
+            let k = radius * 0.55;
+            let stroke = Stroke::new(1.3, color);
+            painter.line_segment([center + Vec2::new(-k, -k), center + Vec2::new(k, k)], stroke);
+            painter.line_segment([center + Vec2::new(k, -k), center + Vec2::new(-k, k)], stroke);
+        }
+        "chart" => {
+            // Three rising bars.
+            let w = radius * 0.42;
+            for (i, h) in [0.55, 1.0, 1.45].into_iter().enumerate() {
+                let x = center.x - radius * 0.85 + i as f32 * (w + radius * 0.22);
+                let bar = Rect::from_min_max(Pos2::new(x, center.y + radius * 0.8 - radius * h), Pos2::new(x + w, center.y + radius * 0.8));
+                painter.rect_filled(bar, CornerRadius::same(1), color);
+            }
+        }
         "gear" => {
             let stroke = Stroke::new(1.3, color);
             for i in 0..8 {
@@ -274,9 +292,10 @@ pub fn draw(root: &mut egui::Ui, state: &mut ChromeState, input: &ChromeInput<'_
                 sidebar_toggle(ui, Rect::from_min_size(Pos2::new(rect.left() + x, rect.top() + 4.0), Vec2::splat(22.0)), colors, &mut out);
             }
             let session = input.workspace.pane(pane_id).and_then(|p| p.active_session());
-            let footer_h = if input.pane_footer && session.is_some() { FOOTER_HEIGHT } else { 0.0 };
+            let terminal_tab = session.is_some_and(|s| s != USAGE_TAB);
+            let footer_h = if input.pane_footer && terminal_tab { FOOTER_HEIGHT } else { 0.0 };
             let terminal = Rect::from_min_max(Pos2::new(rect.left(), tabs.bottom()), Pos2::new(rect.right(), rect.bottom() - footer_h));
-            if let Some(sid) = session {
+            if let Some(sid) = session.filter(|_| terminal_tab) {
                 if footer_h > 0.0 {
                     let footer_rect = Rect::from_min_max(Pos2::new(rect.left(), terminal.bottom()), rect.max);
                     footer(ui, footer_rect, sid, input);
@@ -433,7 +452,8 @@ fn sidebar(ui: &mut egui::Ui, state: &mut ChromeState, input: &ChromeInput<'_>, 
     });
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        let w = ui.available_width() - 32.0;
+        // Room for the usage and settings buttons.
+        let w = ui.available_width() - 2.0 * (28.0 + ui.spacing().item_spacing.x);
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 28.0), Sense::click());
         if state.archived_open || resp.hovered() {
             ui.painter().rect_filled(rect, CornerRadius::same(6), c32(colors.button_background));
@@ -444,6 +464,14 @@ fn sidebar(ui: &mut egui::Ui, state: &mut ChromeState, input: &ChromeInput<'_>, 
         ui.painter().text(Pos2::new(rect.right() - 8.0, rect.center().y), Align2::RIGHT_CENTER, input.archived.len().to_string(), FontId::proportional(11.0), c32(colors.text_dim));
         if resp.clicked() {
             state.archived_open = !state.archived_open;
+        }
+        let (chart, chart_resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+        if chart_resp.hovered() {
+            ui.painter().rect_filled(chart, CornerRadius::same(6), c32(colors.button_background));
+        }
+        paint_icon(ui.painter(), chart.center(), 7.0, "chart", c32(colors.text_dim));
+        if chart_resp.on_hover_text("Usage dashboard").clicked() {
+            out.actions.push(UiAction::OpenUsage);
         }
         let (gear, gear_resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
         if gear_resp.hovered() {
@@ -481,7 +509,7 @@ fn archived_list(ui: &mut egui::Ui, input: &ChromeInput<'_>, out: &mut ChromeOut
         let remove = Rect::from_center_size(Pos2::new(rect.right() - 10.0, rect.top() + 13.0), Vec2::splat(16.0));
         let remove_resp = ui.interact(remove, ui.scope_id().with(("rm-archived", i)), Sense::click());
         if resp.hovered() || remove_resp.hovered() {
-            ui.painter().text(remove.center(), Align2::CENTER_CENTER, "✕", FontId::proportional(11.0), c32(colors.text_dim));
+            paint_icon(ui.painter(), remove.center(), 7.0, "close", c32(colors.text_dim));
         }
         if remove_resp.clicked() {
             out.actions.push(UiAction::RemoveArchived(i));
@@ -574,10 +602,12 @@ fn tab_bar(ui: &mut egui::Ui, pane_id: PaneId, rect: Rect, inset: f32, input: &C
         } else if resp.hovered() {
             p.rect_filled(shape, radius, c32(colors.button_background));
         }
-        let (title, icon, profile, attention) = summary
-            .map(|s| (s.subtitle_or_title(), s.icon.as_str(), s.profile.as_deref(), s.attention))
-            .unwrap_or_else(|| ("…".into(), "shell", None, false));
-        let color = agent_color(input.agents, profile, icon, colors);
+        let (title, icon, profile, attention) = match summary {
+            Some(s) => (s.subtitle_or_title(), s.icon.as_str(), s.profile.as_deref(), s.attention),
+            None if *sid == USAGE_TAB => ("Usage".into(), "chart", None, false),
+            None => ("…".into(), "shell", None, false),
+        };
+        let color = if *sid == USAGE_TAB { c32(colors.accent) } else { agent_color(input.agents, profile, icon, colors) };
         let icon_pos = Pos2::new(tab.left() + 14.0, tab.center().y);
         paint_icon(p, icon_pos, 5.5, icon, color);
         if attention && !active {

@@ -16,7 +16,9 @@ mod renderer;
 mod resources;
 mod session;
 mod settings_ui;
+mod stats_ui;
 mod theme;
+mod usage_stats;
 mod workspace;
 
 use winit::event_loop::EventLoop;

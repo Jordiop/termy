@@ -33,6 +33,10 @@ use crate::theme::{Rgb, Theme};
 
 pub type SessionId = u64;
 
+/// Tab id of the usage dashboard: a workspace tab with no terminal behind it.
+/// Never handed out by [`SessionManager`], so `get(USAGE_TAB)` is always `None`.
+pub const USAGE_TAB: SessionId = SessionId::MAX;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ActivityState {
     /// Produced output within the activity timeout.
