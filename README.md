@@ -111,3 +111,7 @@ keybinding actions at startup. These are useful for checking rendering without
 screen-recording permissions.
 
 Design notes and the sampled palette: [`docs/DESIGN.md`](docs/DESIGN.md).
+
+## License
+
+Termy is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE.md). You may use, modify and share it for any noncommercial purpose. Commercial use is not permitted without a separate license from the author.
