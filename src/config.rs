@@ -99,8 +99,14 @@ pub enum Decorations {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TabStyle {
+    /// Square tabs, accent line on top of the active one.
     Flat,
+    /// Browser-style: rounded top corners, the active tab joins the terminal.
+    Rounded,
+    /// Floating rounded pills.
     Pill,
+    /// Text only, accent underline under the active tab.
+    Underline,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -114,6 +120,10 @@ pub struct WindowConfig {
     pub columns: u16,
     pub rows: u16,
     pub tab_style: TabStyle,
+    /// Corner radius of `rounded` / `pill` tabs, in points.
+    pub tab_radius: f64,
+    /// Widest a tab grows to, in points (tabs shrink to fit).
+    pub tab_max_width: f64,
     pub sidebar_visible: bool,
     pub sidebar_width: f64,
     /// Per-pane status footer (agent state, model, token budget).
@@ -129,7 +139,9 @@ impl Default for WindowConfig {
             decorations: if cfg!(target_os = "macos") { Decorations::Transparent } else { Decorations::Full },
             columns: 120,
             rows: 34,
-            tab_style: TabStyle::Flat,
+            tab_style: TabStyle::Rounded,
+            tab_radius: 8.0,
+            tab_max_width: 190.0,
             sidebar_visible: true,
             sidebar_width: 220.0,
             pane_footer: true,
