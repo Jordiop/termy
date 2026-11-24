@@ -109,6 +109,18 @@ pub enum TabStyle {
     Underline,
 }
 
+/// Where the sidebar's agent launcher and Archived / usage / settings row go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarActions {
+    Top,
+    #[default]
+    Bottom,
+}
+
+pub const SIDEBAR_MIN_WIDTH: f64 = 220.0;
+pub const SIDEBAR_MAX_WIDTH: f64 = SIDEBAR_MIN_WIDTH * 3.0;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WindowConfig {
@@ -125,7 +137,9 @@ pub struct WindowConfig {
     /// Widest a tab grows to, in points (tabs shrink to fit).
     pub tab_max_width: f64,
     pub sidebar_visible: bool,
+    /// Clamped to `SIDEBAR_MIN_WIDTH..=SIDEBAR_MAX_WIDTH`; drag the sidebar edge to resize.
     pub sidebar_width: f64,
+    pub sidebar_actions: SidebarActions,
     /// Per-pane status footer (agent state, model, token budget).
     pub pane_footer: bool,
 }
@@ -143,7 +157,8 @@ impl Default for WindowConfig {
             tab_radius: 8.0,
             tab_max_width: 190.0,
             sidebar_visible: true,
-            sidebar_width: 220.0,
+            sidebar_width: SIDEBAR_MIN_WIDTH,
+            sidebar_actions: SidebarActions::Bottom,
             pane_footer: true,
         }
     }
