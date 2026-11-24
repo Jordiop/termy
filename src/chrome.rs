@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
 use crate::ai_monitor::{Gauge, format_reset, format_tokens};
-use crate::config::{AgentProfile, ResourcesConfig, TabStyle};
+use crate::config::{AgentProfile, ResourcesConfig, SIDEBAR_MIN_WIDTH, SidebarActions, TabStyle};
 use crate::resources::{ResourceUsage, format_bytes, format_cpu};
 use crate::session::{
     ActivityState, ArchivedSession, SessionFilter, SessionId, SessionSummary, USAGE_TAB, filter_counts, format_elapsed,
@@ -53,6 +53,8 @@ pub enum UiAction {
     ResizeSplit { path: Vec<usize>, index: usize, delta: f32, min: f32 },
     EqualizeSplits,
     DismissError,
+    /// Sidebar edge dragged; `done` once released (persist then).
+    ResizeSidebar { width: f32, done: bool },
 }
 
 /// Sidebar UI state that persists across frames.
@@ -124,6 +126,7 @@ pub struct ChromeInput<'a> {
     pub agents: &'a [AgentProfile],
     pub sidebar_visible: bool,
     pub sidebar_width: f32,
+    pub sidebar_actions: SidebarActions,
     pub pane_footer: bool,
     pub tab_style: TabStyle,
     pub tab_radius: f32,
@@ -315,14 +318,16 @@ pub fn draw(root: &mut egui::Ui, state: &mut ChromeState, input: &ChromeInput<'_
     let mut out = ChromeOutput::default();
     let colors = input.colors;
 
-    if input.sidebar_visible {
+    let sidebar_rect = input.sidebar_visible.then(|| {
         egui::Panel::left("sidebar")
             .exact_size(input.sidebar_width)
             .resizable(false)
             .show_separator_line(false)
             .frame(egui::Frame::new().fill(c32(colors.chrome_background)).inner_margin(egui::Margin::symmetric(8, 0)))
-            .show(root, |ui| sidebar(ui, state, input, &mut out));
-    }
+            .show(root, |ui| sidebar(ui, state, input, &mut out))
+            .response
+            .rect
+    });
 
     egui::CentralPanel::no_frame().show(root, |ui| {
         let area = ui.max_rect();
@@ -370,7 +375,32 @@ pub fn draw(root: &mut egui::Ui, state: &mut ChromeState, input: &ChromeInput<'_
         pane_dividers(ui, &dividers, colors, &mut out);
         tab_drag(ui, state, &geoms, input, &mut out);
     });
+    if let Some(rect) = sidebar_rect {
+        sidebar_resize(root, rect, input, &mut out);
+    }
     out
+}
+
+/// Drag the sidebar's right edge to resize it (the app clamps the width);
+/// double-click resets it to the minimum.
+fn sidebar_resize(ui: &mut egui::Ui, sidebar: Rect, input: &ChromeInput<'_>, out: &mut ChromeOutput) {
+    let line = Rect::from_min_max(Pos2::new(sidebar.right() - 0.5, sidebar.top()), Pos2::new(sidebar.right() + 0.5, sidebar.bottom()));
+    let grab = line.expand2(Vec2::new(3.0, 0.0));
+    let resp = ui.interact(grab, ui.scope_id().with("sidebar-resize"), Sense::click_and_drag());
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        ui.painter().rect_filled(line, CornerRadius::ZERO, c32(input.colors.accent).gamma_multiply(0.7));
+    }
+    if resp.dragged() && resp.drag_delta().x != 0.0 {
+        out.actions.push(UiAction::ResizeSidebar { width: input.sidebar_width + resp.drag_delta().x, done: false });
+    }
+    if resp.drag_stopped() {
+        out.actions.push(UiAction::ResizeSidebar { width: input.sidebar_width, done: true });
+    }
+    if resp.double_clicked() {
+        out.actions.push(UiAction::ResizeSidebar { width: SIDEBAR_MIN_WIDTH as f32, done: true });
+    }
+    out.dividers.push(grab);
 }
 
 /// Drag a divider to resize the panes beside it; double-click evens out
@@ -529,47 +559,17 @@ fn sidebar(ui: &mut egui::Ui, state: &mut ChromeState, input: &ChromeInput<'_>, 
     ui.painter().text(Pos2::new(rect.right() - 8.0, rect.center().y), Align2::RIGHT_CENTER, &input.search_shortcut, FontId::proportional(10.5), c32(colors.text_dim));
     ui.add_space(6.0);
 
-    // Filter pills.
-    let counts = filter_counts(input.summaries);
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = Vec2::new(2.0, 4.0);
-        for (filter, label, count, icon) in [
-            (SessionFilter::All, "All", Some(counts.all), None),
-            (SessionFilter::Waiting, "Waiting", (counts.waiting > 0).then_some(counts.waiting), Some("clock")),
-            (SessionFilter::Working, "Working", (counts.working > 0).then_some(counts.working), Some("spinner")),
-        ] {
-            let text = match count {
-                Some(n) => format!("{label} {n}"),
-                None => label.to_owned(),
-            };
-            let font = FontId::proportional(10.5);
-            let galley = ui.painter().layout_no_wrap(text, font, Color32::WHITE);
-            let width = galley.size().x + if icon.is_some() { 26.0 } else { 14.0 };
-            let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::click());
-            let selected = state.filter == filter;
-            let p = ui.painter();
-            if selected {
-                p.rect_filled(rect, CornerRadius::same(6), c32(colors.pill_selected_background));
-            } else if resp.hovered() {
-                p.rect_filled(rect, CornerRadius::same(6), c32(colors.button_background));
-            }
-            let color = c32(if selected { colors.text_primary } else { colors.text_dim });
-            let mut x = rect.left() + 7.0;
-            if let Some(icon) = icon {
-                paint_icon(p, Pos2::new(x + 4.0, rect.center().y), 4.5, icon, color);
-                x += 12.0;
-            }
-            p.galley(Pos2::new(x, rect.center().y - galley.size().y / 2.0), galley, color);
-            if resp.clicked() {
-                state.filter = filter;
-            }
-        }
-    });
+    if input.sidebar_actions == SidebarActions::Top {
+        sidebar_actions(ui, state, input, out);
+        ui.add_space(6.0);
+    }
+
+    filter_pills(ui, state, input);
     ui.add_space(6.0);
 
-    // Footer: error banner, agent launcher, archived + settings. The banner
-    // is measured (at most a few lines, the rest on hover) so it never
-    // pushes the buttons below it off the window.
+    // Footer: error banner, plus the action rows when they're at the
+    // bottom. The banner is measured (at most a few lines, the rest on
+    // hover) so it never pushes the buttons below it off the window.
     let banner = input.error.map(|error| {
         let wrap = (full.width() - 12.0 - 18.0).max(40.0);
         let mut job = egui::text::LayoutJob::simple(error.to_owned(), FontId::proportional(10.5), c32(colors.text_primary), wrap);
@@ -578,7 +578,8 @@ fn sidebar(ui: &mut egui::Ui, state: &mut ChromeState, input: &ChromeInput<'_>, 
         ui.painter().layout_job(job)
     });
     let banner_h = banner.as_ref().map_or(0.0, |g| g.size().y + 12.0);
-    let footer_h = 76.0 + if banner.is_some() { banner_h + 4.0 } else { 0.0 };
+    let actions_h = if input.sidebar_actions == SidebarActions::Bottom { 76.0 } else { 8.0 };
+    let footer_h = actions_h + if banner.is_some() { banner_h + 4.0 } else { 0.0 };
     let list_h = (ui.available_height() - footer_h).max(0.0);
     let focused = input.workspace.focused_session();
 
@@ -625,6 +626,58 @@ fn sidebar(ui: &mut egui::Ui, state: &mut ChromeState, input: &ChromeInput<'_>, 
         }
         ui.add_space(4.0);
     }
+    if input.sidebar_actions == SidebarActions::Bottom {
+        sidebar_actions(&mut ui, state, input, out);
+    }
+}
+
+/// All / Waiting / Working in three equal slots, so counts appearing or
+/// changing never move or wrap them. Labels collapse to icon + count (label
+/// on hover) when a slot is too narrow, which depends on the width only.
+fn filter_pills(ui: &mut egui::Ui, state: &mut ChromeState, input: &ChromeInput<'_>) {
+    let colors = input.colors;
+    let counts = filter_counts(input.summaries);
+    let font = FontId::proportional(10.5);
+    let gap = 2.0;
+    let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
+    let slot_w = (row.width() - 2.0 * gap) / 3.0;
+    let widest = ui.painter().layout_no_wrap("Working 99".into(), font.clone(), Color32::WHITE).size().x + 26.0;
+    let compact = widest > slot_w;
+    let pills = [
+        (SessionFilter::All, "All", counts.all, None),
+        (SessionFilter::Waiting, "Waiting", counts.waiting, Some("clock")),
+        (SessionFilter::Working, "Working", counts.working, Some("spinner")),
+    ];
+    for (i, (filter, label, count, icon)) in pills.into_iter().enumerate() {
+        let rect = Rect::from_min_size(Pos2::new(row.left() + i as f32 * (slot_w + gap), row.top()), Vec2::new(slot_w, row.height()));
+        let resp = ui.interact(rect, ui.scope_id().with(("filter", i)), Sense::click());
+        let selected = state.filter == filter;
+        let p = ui.painter();
+        if selected {
+            p.rect_filled(rect, CornerRadius::same(6), c32(colors.pill_selected_background));
+        } else if resp.hovered() {
+            p.rect_filled(rect, CornerRadius::same(6), c32(colors.button_background));
+        }
+        let color = c32(if selected { colors.text_primary } else { colors.text_dim });
+        let text = if compact && icon.is_some() { count.to_string() } else { format!("{label} {count}") };
+        let galley = p.layout_no_wrap(text, font.clone(), color);
+        let content_w = galley.size().x + if icon.is_some() { 12.0 } else { 0.0 };
+        let mut x = rect.center().x - content_w / 2.0;
+        if let Some(icon) = icon {
+            paint_icon(p, Pos2::new(x + 4.0, rect.center().y), 4.5, icon, color);
+            x += 12.0;
+        }
+        p.galley(Pos2::new(x, rect.center().y - galley.size().y / 2.0), galley, color);
+        let resp = if compact { resp.on_hover_text(label) } else { resp };
+        if resp.clicked() {
+            state.filter = filter;
+        }
+    }
+}
+
+/// Agent launcher row, then Archived + usage + settings.
+fn sidebar_actions(ui: &mut egui::Ui, state: &mut ChromeState, input: &ChromeInput<'_>, out: &mut ChromeOutput) {
+    let colors = input.colors;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         let launchers = input.agents.iter().map(|a| (Some(a.name.clone()), a.icon.as_str(), a.color.map(c32), a.name.as_str()));
@@ -726,18 +779,20 @@ fn session_card(ui: &mut egui::Ui, state: &mut ChromeState, s: &SessionSummary, 
     }
 
     let text_left = rect.left() + 26.0;
-    let elapsed = format_elapsed(s.elapsed);
-    let title_rect = Rect::from_min_max(Pos2::new(text_left, rect.top() + 4.0), Pos2::new(rect.right() - 34.0, rect.top() + 20.0));
+    let elapsed = ui.painter().text(Pos2::new(rect.right() - 6.0, rect.top() + 13.0), Align2::RIGHT_CENTER, format_elapsed(s.elapsed), FontId::proportional(11.0), c32(colors.text_dim));
+    let title_rect = Rect::from_min_max(Pos2::new(text_left, rect.top() + 4.0), Pos2::new(elapsed.left() - 6.0, rect.top() + 20.0));
+    // The task leads when the agent reported one; the session name goes below.
+    let task_first = !s.renamed && s.subtitle != s.state.label();
+    let (title, subtitle) = if task_first { (&s.subtitle, &s.title) } else { (&s.title, &s.subtitle) };
     if !rename_field(ui, state, s.id, title_rect, 12.5, colors, out) {
-        ui.painter().with_clip_rect(title_rect).text(Pos2::new(text_left, rect.top() + 13.0), Align2::LEFT_CENTER, &s.title, FontId::proportional(12.5), c32(colors.text_primary));
+        ui.painter().with_clip_rect(title_rect).text(Pos2::new(text_left, rect.top() + 13.0), Align2::LEFT_CENTER, title, FontId::proportional(12.5), c32(colors.text_primary));
     }
     let p = ui.painter();
-    p.text(Pos2::new(rect.right() - 6.0, rect.top() + 13.0), Align2::RIGHT_CENTER, elapsed, FontId::proportional(11.0), c32(colors.text_dim));
 
     // Tokens used (or left in the session budget) on the second line.
-    let tokens = input.usage.get(&s.id).map(|u| match u.session_budget {
-        Some(g) => format!("{} left", format_tokens(g.remaining())),
-        None => format_tokens(u.session_tokens),
+    let tokens = input.usage.get(&s.id).and_then(|u| match u.session_budget {
+        Some(g) => Some(format!("{} left", format_tokens(g.remaining()))),
+        None => (u.session_tokens > 0).then(|| format_tokens(u.session_tokens)),
     });
     let tokens_w = match tokens {
         Some(t) => {
@@ -753,7 +808,7 @@ fn session_card(ui: &mut egui::Ui, state: &mut ChromeState, s: &SessionSummary, 
         _ => colors.text_dim,
     };
     let sub_rect = Rect::from_min_max(Pos2::new(text_left, rect.top() + 20.0), Pos2::new(rect.right() - 6.0 - tokens_w, rect.bottom()));
-    p.with_clip_rect(sub_rect).text(Pos2::new(text_left, rect.top() + 28.0), Align2::LEFT_CENTER, &s.subtitle, FontId::proportional(11.0), c32(sub_color));
+    p.with_clip_rect(sub_rect).text(Pos2::new(text_left, rect.top() + 28.0), Align2::LEFT_CENTER, subtitle, FontId::proportional(11.0), c32(sub_color));
 
     if resp.double_clicked() {
         state.start_rename(s.id, s.title.clone());

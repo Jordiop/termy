@@ -15,7 +15,7 @@ use crate::ai_monitor::{WeeklyReset, format_tokens};
 use crate::chrome::{c32, paint_icon};
 use crate::config::{
     Action, AgentProfile, AppConfig, CursorShape, Decorations, JsonlSource, KeyCombo, MetricsSource, ShellConfig,
-    TabStyle, TokenBudget,
+    SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SidebarActions, TabStyle, TokenBudget,
 };
 use crate::theme::{Rgb, Theme, ThemeRegistry, UiColors};
 
@@ -262,7 +262,13 @@ fn appearance(ui: &mut egui::Ui, state: &mut SettingsState, input: &SettingsInpu
         ui.checkbox(&mut draft.window.sidebar_visible, "Visible at startup");
         ui.end_row();
         ui.label("Sidebar width");
-        ui.add(egui::Slider::new(&mut draft.window.sidebar_width, 160.0..=380.0).step_by(1.0).suffix(" pt"));
+        ui.add(egui::Slider::new(&mut draft.window.sidebar_width, SIDEBAR_MIN_WIDTH..=SIDEBAR_MAX_WIDTH).step_by(1.0).suffix(" pt"));
+        ui.end_row();
+        ui.label("Sidebar buttons");
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut draft.window.sidebar_actions, SidebarActions::Top, "Top");
+            ui.selectable_value(&mut draft.window.sidebar_actions, SidebarActions::Bottom, "Bottom");
+        });
         ui.end_row();
         ui.label("Pane footer");
         ui.checkbox(&mut draft.window.pane_footer, "Agent status, model and token budget");

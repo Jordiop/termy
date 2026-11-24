@@ -25,7 +25,10 @@ use std::collections::HashMap;
 use crate::ai_monitor::now_ms;
 use crate::chrome::{self, ChromeInput, ChromeOutput, ChromeState, UiAction, UsageView};
 use crate::settings_ui::{self, SettingsInput, SettingsOutput, SettingsState};
-use crate::config::{Action, AppConfig, ConfigFile, ConfigPaths, ConfigWatcher, Decorations, FontConfig, Reload, WatchEvent};
+use crate::config::{
+    Action, AppConfig, ConfigFile, ConfigPaths, ConfigWatcher, Decorations, FontConfig, Reload, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+    WatchEvent,
+};
 use crate::input::{self, KeyModes, MouseButton, MouseEventKind, WheelAction};
 use crate::renderer::{CursorDraw, EguiFrame, PaneFrame, Renderer};
 use crate::resources::ResourceMonitor;
@@ -233,7 +236,7 @@ impl App {
         let w = &self.config.window;
         let font = self.effective_font();
         let (cw, ch) = (font.size * 0.62, font.size * font.line_height);
-        let width = if w.sidebar_visible { w.sidebar_width } else { 0.0 } + w.columns as f64 * cw + 2.0 * w.padding_x;
+        let width = if w.sidebar_visible { w.sidebar_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH) } else { 0.0 } + w.columns as f64 * cw + 2.0 * w.padding_x;
         let height = chrome::TAB_BAR_HEIGHT as f64 + w.rows as f64 * ch + 2.0 * w.padding_y;
         let transparent = w.opacity < 1.0;
 
@@ -493,6 +496,7 @@ impl App {
                 self.spawn(None, None);
             }
             UiAction::ToggleSidebar => self.sidebar_visible = !self.sidebar_visible,
+            UiAction::ResizeSidebar { width, done } => self.resize_sidebar(width as f64, done),
             UiAction::JumpToBottom(id) => {
                 if let Some(s) = self.sessions.get(id) {
                     s.scroll_to_bottom();
@@ -564,6 +568,18 @@ impl App {
             }
         }
         self.request_redraw();
+    }
+
+    /// While settings are open the width only goes to the draft (saved with
+    /// it); otherwise it's written to config.toml on release.
+    fn resize_sidebar(&mut self, width: f64, done: bool) {
+        let width = width.round().clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+        self.config.window.sidebar_width = width;
+        if self.settings.open {
+            self.settings.draft.window.sidebar_width = width;
+        } else if done && let Err(e) = self.config_file.save(&self.config) {
+            self.error = Some(e.to_string());
+        }
     }
 
     /// Applies the settings draft live.
@@ -951,7 +967,8 @@ impl App {
             workspace,
             agents: &config.agents,
             sidebar_visible: *sidebar_visible,
-            sidebar_width: config.window.sidebar_width as f32,
+            sidebar_width: config.window.sidebar_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH) as f32,
+            sidebar_actions: config.window.sidebar_actions,
             pane_footer: config.window.pane_footer,
             tab_style: config.window.tab_style,
             tab_radius: config.window.tab_radius.clamp(0.0, 14.0) as f32,
