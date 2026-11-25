@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::Line;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{Config as TermConfig, Osc52, Term, TermMode};
@@ -28,6 +29,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::Wake;
 use crate::config::{AgentProfile, AppConfig, CursorShape, expand_tilde};
+use crate::osc::{OscEvent, OscScanner};
+use crate::prompts::{self, PromptMarks};
 use crate::pty::{ExitInfo, PtyHandle, SpawnOptions, default_shell};
 use crate::theme::{Rgb, Theme};
 
@@ -119,6 +122,52 @@ pub fn build_command(profile: Option<&AgentProfile>, shell: (String, Vec<String>
     args.push(profile.command.clone());
     args.extend(profile.args.iter().cloned());
     (shell_program, args)
+}
+
+/// zsh reads its startup files from `$ZDOTDIR`: point it at termy's
+/// `.zshenv`, which restores the user's own (passed in `TERMY_ZDOTDIR`).
+fn inject_zsh_integration(env: &mut Vec<(String, String)>) {
+    let Some(dir) = shell_integration_dir() else { return };
+    let user = env
+        .iter()
+        .rposition(|(k, _)| k == "ZDOTDIR")
+        .map(|i| env.remove(i).1)
+        .or_else(|| std::env::var("ZDOTDIR").ok());
+    env.retain(|(k, _)| k != "ZDOTDIR");
+    if let Some(user) = user {
+        env.push(("TERMY_ZDOTDIR".into(), user));
+    }
+    env.push(("ZDOTDIR".into(), dir.join("zsh").to_string_lossy().into_owned()));
+}
+
+/// Writes the integration scripts to the cache directory once per run.
+fn shell_integration_dir() -> Option<&'static Path> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = dirs::cache_dir()?.join(crate::config::APP_NAME).join("shell-integration");
+        let files = [
+            ("zsh/.zshenv", include_str!("../assets/shell/zsh/.zshenv")),
+            ("zsh/termy.zsh", include_str!("../assets/shell/zsh/termy.zsh")),
+        ];
+        let write = || -> std::io::Result<()> {
+            for (name, content) in files {
+                let path = dir.join(name);
+                std::fs::create_dir_all(path.parent().expect("has a parent"))?;
+                if std::fs::read_to_string(&path).ok().as_deref() != Some(content) {
+                    std::fs::write(&path, content)?;
+                }
+            }
+            Ok(())
+        };
+        match write() {
+            Ok(()) => Some(dir),
+            Err(e) => {
+                log::warn!("shell integration disabled: could not write {}: {e}", dir.display());
+                None
+            }
+        }
+    })
+    .as_deref()
 }
 
 /// Strips spinner glyphs and status markers agents put in front of titles
@@ -263,16 +312,38 @@ impl EventListener for Listener {
 pub struct TermState {
     term: Term<Listener>,
     parser: Processor,
+    scanner: OscScanner,
+    marks: PromptMarks,
+    /// Working directory reported by the shell (OSC 7).
+    cwd: Option<PathBuf>,
 }
 
 impl TermState {
     fn new(config: TermConfig, cols: u16, rows: u16, listener: Listener) -> Self {
         let size = GridSize { cols: cols.max(1) as usize, rows: rows.max(1) as usize };
-        Self { term: Term::new(config, &size, listener), parser: Processor::new() }
+        Self {
+            term: Term::new(config, &size, listener),
+            parser: Processor::new(),
+            scanner: OscScanner::default(),
+            marks: PromptMarks::default(),
+            cwd: None,
+        }
     }
 
+    /// Parses output, applying shell-integration sequences where they occur.
     pub fn advance(&mut self, bytes: &[u8]) {
-        self.parser.advance(&mut self.term, bytes);
+        let mut start = 0;
+        for (end, event) in self.scanner.feed(bytes) {
+            self.parser.advance(&mut self.term, &bytes[start..end]);
+            start = end;
+            match event {
+                OscEvent::Cwd(path) => self.cwd = Some(path),
+                // Inside a synchronized update the parser buffers text, so a mark would land early.
+                _ if self.parser.sync_timeout().sync_timeout().is_some() => {}
+                _ => self.marks.apply(&mut self.term, &event),
+            }
+        }
+        self.parser.advance(&mut self.term, &bytes[start..]);
     }
 
     /// Applies a pending synchronized update (DEC mode 2026) whose timeout
@@ -342,6 +413,8 @@ pub struct GridSnapshot {
     pub cursor: Option<CursorSnapshot>,
     pub display_offset: usize,
     pub background: Rgb,
+    /// Rows where a shell prompt starts, with the gutter mark color.
+    pub prompt_marks: Vec<(usize, Rgb)>,
 }
 
 #[cfg(test)]
@@ -406,7 +479,8 @@ fn bold_as_bright(color: Color) -> Color {
     }
 }
 
-fn snapshot(term: &Term<Listener>, theme: &Theme) -> GridSnapshot {
+fn snapshot(state: &TermState, theme: &Theme) -> GridSnapshot {
+    let term = &state.term;
     let content = term.renderable_content();
     let (cols, rows) = (term.columns(), term.screen_lines());
     let offset = content.display_offset as i32;
@@ -473,7 +547,23 @@ fn snapshot(term: &Term<Listener>, theme: &Theme) -> GridSnapshot {
         })
     };
 
-    GridSnapshot { cols, rows, cells, cursor, display_offset: content.display_offset, background }
+    // A gutter mark on each prompt's first line; failed commands stand out.
+    let grid = term.grid();
+    let mut prompt_marks = Vec::new();
+    let mut above = (offset < -grid.topmost_line().0).then(|| prompts::row_prompt(&grid[Line(-offset - 1)])).flatten();
+    for row in 0..rows {
+        let seq = prompts::row_prompt(&grid[Line(row as i32 - offset)]);
+        if let Some(s) = seq.filter(|_| seq != above) {
+            let color = match state.marks.exit_code(s) {
+                Some(code) if code != 0 => theme.ansi(1),
+                _ => theme.colors.foreground.scale(0.4),
+            };
+            prompt_marks.push((row, color));
+        }
+        above = seq;
+    }
+
+    GridSnapshot { cols, rows, cells, cursor, display_offset: content.display_offset, background, prompt_marks }
 }
 
 // ---------------------------------------------------------------------------
@@ -537,6 +627,9 @@ impl Session {
 
         let mut env: Vec<(String, String)> = config.terminal.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         env.push(("TERMY_SESSION_ID".into(), id.to_string()));
+        if req.profile.is_none() && config.terminal.shell_integration && program_name(&program) == "zsh" {
+            inject_zsh_integration(&mut env);
+        }
 
         let shared = Arc::new(Shared {
             pty_input: OnceLock::new(),
@@ -630,6 +723,24 @@ impl Session {
         self.shared.dirty.store(true, Ordering::Release);
     }
 
+    /// Scrolls to the previous (`up`) or next shell prompt.
+    pub fn jump_to_prompt(&self, up: bool) {
+        if prompts::jump(&mut self.state.lock().term, up) {
+            self.shared.dirty.store(true, Ordering::Release);
+        }
+    }
+
+    /// Output of the last finished command (needs shell integration).
+    pub fn last_command_output(&self) -> Option<String> {
+        prompts::last_output(&self.state.lock().term)
+    }
+
+    /// Where the shell is now (OSC 7), else where the session started. Not
+    /// checked to exist (an ssh session reports remote paths): spawn does.
+    pub fn current_dir(&self) -> PathBuf {
+        self.state.lock().cwd.clone().unwrap_or_else(|| self.cwd.clone())
+    }
+
     /// Viewport is scrolled up (show "Jump to bottom").
     pub fn is_scrolled(&self) -> bool {
         self.state.lock().term.grid().display_offset() > 0
@@ -649,7 +760,7 @@ impl Session {
     pub fn snapshot(&self, theme: &Theme) -> GridSnapshot {
         let mut state = self.state.lock();
         state.flush_expired_sync();
-        snapshot(&state.term, theme)
+        snapshot(&state, theme)
     }
 
     /// Read access to the emulator (selection, search, …).
@@ -730,7 +841,7 @@ impl Session {
             profile: self.kind.profile.clone(),
             project_name: self.project.name.clone(),
             project_root: self.project.root.clone(),
-            cwd: self.cwd.clone(),
+            cwd: self.current_dir(),
             state,
             attention: self.needs_attention(),
             elapsed: now.saturating_duration_since(self.started),
@@ -886,7 +997,7 @@ impl SessionManager {
             task: session.task_title(),
             profile: session.kind.profile.clone(),
             icon: session.kind.icon.clone(),
-            cwd: session.cwd.clone(),
+            cwd: session.current_dir(),
             project: session.project.name.clone(),
             started_unix_ms: unix_ms(session.created_at),
             closed_unix_ms: unix_ms(SystemTime::now()),
@@ -983,7 +1094,7 @@ mod tests {
         let (mut st, _) = headless(20, 3);
         let t = theme();
         st.advance(b"\x1b[31mR\x1b[0m\x1b[1;32mG\x1b[0m\x1b[38;5;196mX\x1b[38;2;1;2;3mT\x1b[0m\x1b[7mI\x1b[0m");
-        let snap = snapshot(&st.term, &t);
+        let snap = snapshot(&st, &t);
         assert_eq!(snap.row_text(0), "RGXTI");
         assert_eq!(snap.cell(0, 0).fg, t.colors.normal.red);
         assert_eq!(snap.cell(0, 1).fg, t.colors.bright.green); // bold → bright
@@ -1000,7 +1111,7 @@ mod tests {
     fn wide_chars_and_combining_marks() {
         let (mut st, _) = headless(10, 2);
         st.advance("日本e\u{301}".as_bytes());
-        let snap = snapshot(&st.term, &theme());
+        let snap = snapshot(&st, &theme());
         assert!(snap.cell(0, 0).flags.contains(Flags::WIDE_CHAR));
         assert!(snap.cell(0, 1).flags.contains(Flags::WIDE_CHAR_SPACER));
         assert_eq!(snap.cell(0, 4).c, 'e');
@@ -1015,11 +1126,11 @@ mod tests {
             st.advance(format!("line{i}\r\n").as_bytes());
         }
         let t = theme();
-        let snap = snapshot(&st.term, &t);
+        let snap = snapshot(&st, &t);
         assert_eq!(snap.row_text(0), "line8");
         assert_eq!(snap.row_text(1), "line9");
         st.term.scroll_display(Scroll::Delta(3));
-        let snap = snapshot(&st.term, &t);
+        let snap = snapshot(&st, &t);
         assert_eq!(snap.display_offset, 3);
         assert_eq!(snap.row_text(0), "line5");
         assert!(snap.cursor.is_none() || snap.cursor.unwrap().row < 3);
@@ -1066,9 +1177,9 @@ mod tests {
     fn synchronized_updates_are_flushed() {
         let (mut st, _) = headless(20, 2);
         st.advance(b"\x1b[?2026hhidden");
-        assert_eq!(snapshot(&st.term, &theme()).row_text(0), "");
+        assert_eq!(snapshot(&st, &theme()).row_text(0), "");
         st.advance(b"\x1b[?2026l");
-        assert_eq!(snapshot(&st.term, &theme()).row_text(0), "hidden");
+        assert_eq!(snapshot(&st, &theme()).row_text(0), "hidden");
     }
 
     #[test]

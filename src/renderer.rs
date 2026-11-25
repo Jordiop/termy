@@ -693,6 +693,13 @@ impl Renderer {
                 }
             }
 
+            // Prompt marks sit in the left padding (over column 0 without padding).
+            let bar = (2.0 * line).max(2.0);
+            for &(row, color) in &snap.prompt_marks {
+                let x = ax + ((ox - ax - bar) / 2.0).max(0.0);
+                quads.push(Quad::new(x, oy + row as f32 * m.height, bar, m.height, color, 1.0));
+            }
+
             let mut cursor_text = None;
             if let Some(cursor) = snap.cursor.filter(|_| pane.cursor != CursorDraw::Hidden) {
                 let x = ox + cursor.col as f32 * m.width;
@@ -900,6 +907,7 @@ mod tests {
             cursor: None,
             display_offset: 0,
             background: Rgb::default(),
+            prompt_marks: Vec::new(),
         };
         fonts.sync(1, &mk("ab  cd  "), None);
         let first_row_hash = fonts.rows[&1][0].hash;

@@ -296,7 +296,7 @@ impl App {
             None => None,
         };
         // New sessions start where the focused one is.
-        let cwd = self.workspace.focused_session().and_then(|id| self.sessions.get(id)).map(|s| s.cwd.clone());
+        let cwd = self.workspace.focused_session().and_then(|id| self.sessions.get(id)).map(|s| s.current_dir());
         let (cols, rows) = self
             .workspace
             .focused_session()
@@ -474,6 +474,19 @@ impl App {
             Action::DecreaseFont => self.set_font_delta(self.font_delta - 1.0),
             Action::ResetFont => self.set_font_delta(0.0),
             Action::ReloadConfig => self.reload_config(),
+            Action::PrevPrompt | Action::NextPrompt => {
+                if let Some(s) = self.focused() {
+                    s.jump_to_prompt(action == Action::PrevPrompt);
+                }
+            }
+            Action::CopyLastOutput => {
+                let text = self.focused().and_then(|s| s.last_command_output());
+                if let Some(text) = text
+                    && let Some(cb) = self.clipboard()
+                {
+                    let _ = cb.set_text(text);
+                }
+            }
         }
         self.request_redraw();
     }
