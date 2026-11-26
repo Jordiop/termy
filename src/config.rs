@@ -80,6 +80,7 @@ pub struct AppConfig {
     pub appearance: AppearanceConfig,
     pub monitor: MonitorConfig,
     pub resources: ResourcesConfig,
+    pub links: LinksConfig,
     pub keybindings: Keybindings,
     /// `[[agents]]`: AI CLI profiles. Must stay last (array of tables).
     pub agents: Vec<AgentProfile>,
@@ -313,6 +314,16 @@ impl ResourcesConfig {
     pub fn active(&self, pane_footer: bool) -> bool {
         pane_footer && self.enabled && (self.show_cpu || self.show_memory || self.show_disk)
     }
+}
+
+/// `[links]`: what Cmd/Ctrl+click on a link does.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LinksConfig {
+    /// Command for `path:line:col` links, with `{file}`, `{line}` and `{col}`
+    /// (e.g. `code -g {file}:{line}:{col}`). `None` → the system opener.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub editor: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

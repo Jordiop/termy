@@ -50,6 +50,13 @@ the directory you `cd`'d to. Your own `.zshenv`/`.zshrc` load as usual. Other
 shells that emit OSC 133 themselves get the same features. Turn it off with
 `shell_integration = false` in `[terminal]`.
 
+**Links**: hold ⌘ (Ctrl on Windows/Linux) and hover a URL, a link a program
+sent (OSC 8, its address shows in a tooltip) or a path like `src/app.rs:12:5`
+to underline it; click to open it. Paths are resolved against the shell's
+directory and only count when the file exists. URLs open in the browser; files
+open in `[links] editor` (e.g. `editor = "code -g {file}:{line}:{col}"`) or
+else with the system opener, which never runs executables.
+
 **Session state**: each session is *Working* (recent output), *Waiting*
 (quiet) or *Needs you*: the program rang the bell, sent a notification
 (OSC 9 / 777, whose message becomes the card's title), or Claude Code ended
@@ -81,6 +88,8 @@ comments and formatting.
 * `[appearance]` `theme`: one of `dark-oled`, `ghostty-dark`, `catppuccin-mocha`,
   `tokyo-night`, `gruvbox-dark`, `solarized-light`, or your own
   `~/.config/termy/themes/<name>.toml` (same format as `assets/themes/`)
+* `[links]` `editor`: command for `path:line:col` links, with `{file}`,
+  `{line}` and `{col}`
 * `[monitor]` and `[[agents]]`: agent profiles and token budgets
 * `[resources]`: per-tab CPU / RAM / disk I/O in the pane footer (`enabled`,
   `show_cpu`, `show_memory`, `show_disk`, `interval_ms`). It counts the tab's
@@ -118,7 +127,7 @@ termy never opens a network connection.
 ## Development
 
 ```sh
-cargo test     # 111 tests: config, themes, PTY, VT emulation, prompt marks, session state, token parsing, usage stats, layout, input
+cargo test     # 116 tests: config, themes, PTY, VT emulation, prompt marks, session state, links, token parsing, usage stats, layout, input
 cargo clippy --all-targets
 ```
 
