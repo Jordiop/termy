@@ -622,6 +622,8 @@ pub struct Session {
     pub project: Project,
     /// User-assigned name (rename from the sidebar).
     pub custom_title: Option<String>,
+    /// Agent conversation this session resumed (the agent's session id).
+    pub resumed: Option<String>,
     pub created_at: SystemTime,
     started: Instant,
     state: Arc<Mutex<TermState>>,
@@ -637,6 +639,8 @@ pub struct SpawnRequest {
     pub cwd: Option<PathBuf>,
     pub cols: u16,
     pub rows: u16,
+    /// Agent conversation to reopen (`profile`'s resume args).
+    pub resume: Option<String>,
 }
 
 impl Session {
@@ -656,7 +660,11 @@ impl Session {
             Some(p) => SessionKind { profile: Some(p.name.clone()), icon: p.icon.clone(), label: p.name.clone() },
             None => SessionKind { profile: None, icon: "shell".into(), label: shell_name },
         };
-        let (program, args) = build_command(req.profile.as_ref(), shell);
+        let mut profile = req.profile.clone();
+        if let (Some(p), Some(session_id)) = (&mut profile, &req.resume) {
+            p.args.extend(p.resume_args(session_id));
+        }
+        let (program, args) = build_command(profile.as_ref(), shell);
         let (cols, rows) = (req.cols.max(2), req.rows.max(1));
 
         let mut env: Vec<(String, String)> = config.terminal.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -709,6 +717,7 @@ impl Session {
             cwd,
             kind,
             custom_title: None,
+            resumed: req.resume,
             created_at: SystemTime::now(),
             started: Instant::now(),
             state,
@@ -990,6 +999,21 @@ pub fn group_sessions(summaries: &[SessionSummary], filter: SessionFilter, query
 // Manager & archive
 // ---------------------------------------------------------------------------
 
+/// A tab of the workspace saved at quit (`workspace.json`). The terminal
+/// contents aren't kept: they take space and may hold secrets.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedTab {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    pub cwd: PathBuf,
+    /// Name the user gave the tab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Agent conversation to resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session: Option<String>,
+}
+
 /// A closed session, persisted in `archive.json` and restorable.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ArchivedSession {
@@ -1076,7 +1100,7 @@ impl SessionManager {
     pub fn restore(&mut self, index: usize, config: &AppConfig, theme: &Theme, cols: u16, rows: u16) -> Result<SessionId, String> {
         let entry = self.archived.get(index).cloned().ok_or("no such archived session")?;
         let profile = entry.profile.as_deref().and_then(|name| config.agent(name)).cloned();
-        let id = self.spawn(config, theme, SpawnRequest { profile, cwd: Some(entry.cwd.clone()), cols, rows })?;
+        let id = self.spawn(config, theme, SpawnRequest { profile, cwd: Some(entry.cwd.clone()), cols, rows, resume: None })?;
         if let Some(s) = self.get_mut(id) {
             s.custom_title = (entry.title != s.kind.label).then_some(entry.title);
         }
@@ -1434,6 +1458,24 @@ mod tests {
         // With a `✳` title the echo of what the user types isn't work.
         s.input("\n");
         assert_eq!(s.activity(Instant::now(), timeout), ActivityState::Waiting);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_sessions_resume_their_conversation() {
+        let t = theme();
+        let mut manager = SessionManager::new(noop_wake(), None);
+        let profile = AgentProfile {
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), "echo \"resumed $1\"; read _".into(), "sh".into()],
+            resume_args: Some(vec!["{session_id}".into()]),
+            ..crate::config::default_agents().remove(0)
+        };
+        let req = SpawnRequest { profile: Some(profile), cols: 40, rows: 5, resume: Some("abc-123".into()), ..Default::default() };
+        let id = manager.spawn(&sh_config("true"), &t, req).unwrap();
+        let s = manager.get(id).unwrap();
+        assert!(wait_until(|| (0..5).any(|r| s.snapshot(&t).row_text(r) == "resumed abc-123")));
+        assert_eq!(s.resumed.as_deref(), Some("abc-123"));
     }
 
     #[cfg(unix)]

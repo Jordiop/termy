@@ -32,11 +32,11 @@ use crate::config::{
 use crate::input::{self, KeyModes, MouseButton, MouseEventKind, WheelAction};
 use crate::renderer::{CursorDraw, EguiFrame, PaneFrame, Renderer};
 use crate::resources::ResourceMonitor;
-use crate::session::{GridSnapshot, SessionId, SessionManager, SpawnRequest, USAGE_TAB};
+use crate::session::{GridSnapshot, SavedTab, SessionId, SessionManager, SessionSummary, SpawnRequest, USAGE_TAB};
 use crate::stats_ui::{self, StatsInput, StatsState};
 use crate::theme::{Theme, ThemeRegistry};
 use crate::usage_stats::UsageStats;
-use crate::workspace::{PaneId, Rect, SplitDir, Workspace};
+use crate::workspace::{Layout, PaneId, Rect, SplitDir, Workspace};
 
 #[derive(Debug, Clone, Copy)]
 pub enum UserEvent {
@@ -87,6 +87,8 @@ pub struct App {
     theme: Theme,
     sessions: SessionManager,
     workspace: Workspace,
+    /// Last `workspace.json` written, and when it was last checked.
+    saved_workspace: (Option<String>, Instant),
     monitor: AiMonitor,
     resources: ResourceMonitor,
     _watcher: Option<ConfigWatcher>,
@@ -158,6 +160,7 @@ impl App {
             themes,
             theme,
             workspace: Workspace::new(),
+            saved_workspace: (None, Instant::now()),
             _watcher: watcher,
             gfx: None,
             chrome: ChromeState::default(),
@@ -303,7 +306,7 @@ impl App {
             .and_then(|id| self.sessions.get(id))
             .map(|s| s.size())
             .unwrap_or((self.config.window.columns, self.config.window.rows));
-        match self.sessions.spawn(&self.config, &self.theme, SpawnRequest { profile, cwd, cols, rows }) {
+        match self.sessions.spawn(&self.config, &self.theme, SpawnRequest { profile, cwd, cols, rows, resume: None }) {
             Ok(id) => {
                 match split {
                     Some(dir) => {
@@ -636,7 +639,64 @@ impl App {
     }
 
     /// Token usage for each session running a known agent.
-    fn usage_views(&self, summaries: &[crate::session::SessionSummary]) -> HashMap<SessionId, UsageView> {
+    /// Reopens the panes and tabs saved at the last quit. False if there
+    /// was nothing to restore.
+    fn restore_workspace(&mut self) -> bool {
+        let path = &self.config_file.paths.workspace_file;
+        let Ok(text) = std::fs::read_to_string(path) else { return false };
+        let layout: Layout<SavedTab> = match serde_json::from_str(&text) {
+            Ok(layout) => layout,
+            Err(e) => {
+                log::warn!("{}: {e}", path.display());
+                return false;
+            }
+        };
+        let (config, theme, sessions) = (&self.config, &self.theme, &mut self.sessions);
+        let (cols, rows) = (config.window.columns, config.window.rows);
+        self.workspace = Workspace::from_layout(layout, |tab| {
+            // A profile removed since then reopens as a shell.
+            let profile = tab.profile.as_deref().and_then(|name| config.agent(name)).cloned();
+            let resume = tab.agent_session.filter(|_| profile.is_some());
+            let req = SpawnRequest { profile, cwd: Some(tab.cwd), cols, rows, resume };
+            let id = sessions.spawn(config, theme, req).map_err(|e| log::warn!("restore: {e}")).ok()?;
+            sessions.get_mut(id)?.custom_title = tab.title;
+            Some(id)
+        });
+        !self.workspace.is_empty()
+    }
+
+    /// Writes `workspace.json` if the layout or a tab changed (no tabs:
+    /// removes it, so the next launch starts fresh).
+    fn save_workspace(&mut self, summaries: &[SessionSummary]) {
+        self.saved_workspace.1 = Instant::now();
+        let store = self.monitor.store().read();
+        let layout = self.workspace.to_layout(|id| {
+            let s = summaries.iter().find(|s| s.id == id)?;
+            let agent = s.profile.as_deref().and_then(|name| self.config.agent(name));
+            let agent_session = agent
+                .and_then(|a| store.latest_session(&a.name, &s.cwd, s.started_unix_ms.saturating_sub(5_000)))
+                .map(|u| u.session_id.clone())
+                // A resumed conversation with no new activity yet.
+                .or_else(|| agent.and(self.sessions.get(id)?.resumed.clone()));
+            Some(SavedTab { profile: s.profile.clone(), cwd: s.cwd.clone(), title: s.renamed.then(|| s.title.clone()), agent_session })
+        });
+        drop(store);
+        let json = layout.and_then(|l| serde_json::to_string_pretty(&l).ok());
+        if json == self.saved_workspace.0 {
+            return;
+        }
+        let path = &self.config_file.paths.workspace_file;
+        let result = match &json {
+            Some(json) => crate::config::write_atomic(path, json),
+            None => std::fs::remove_file(path).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }),
+        };
+        match result {
+            Ok(()) => self.saved_workspace.0 = json,
+            Err(e) => log::warn!("{}: {e}", path.display()),
+        }
+    }
+
+    fn usage_views(&self, summaries: &[SessionSummary]) -> HashMap<SessionId, UsageView> {
         let store = self.monitor.store().read();
         let now = now_ms();
         let mut views = HashMap::new();
@@ -1086,6 +1146,9 @@ impl App {
         for action in out.actions {
             self.apply_ui_action(action);
         }
+        if now >= self.saved_workspace.1 + Duration::from_secs(2) {
+            self.save_workspace(&summaries);
+        }
         if self.stats != stats_before {
             // This frame drew stats for the old view; show the new one.
             if self.stats.range != stats_before.range {
@@ -1126,7 +1189,9 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         if self.sessions.is_empty() {
-            self.spawn(None, None);
+            if !self.restore_workspace() {
+                self.spawn(None, None);
+            }
             if let Ok(text) = std::env::var("TERMY_DEMO_INPUT")
                 && let Some(s) = self.focused()
             {
@@ -1143,6 +1208,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
         }
+    }
+
+    fn exiting(&mut self, _: &ActiveEventLoop) {
+        let summaries = self.sessions.summaries(Instant::now(), self.activity_timeout());
+        self.save_workspace(&summaries);
     }
 
     fn new_events(&mut self, _: &ActiveEventLoop, cause: StartCause) {
