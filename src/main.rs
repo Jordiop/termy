@@ -12,6 +12,7 @@ mod chrome;
 mod config;
 mod input;
 mod osc;
+mod palette;
 mod paste;
 mod prompts;
 mod pty;

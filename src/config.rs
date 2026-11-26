@@ -473,10 +473,11 @@ pub enum Action {
     PrevPrompt,
     NextPrompt,
     CopyLastOutput,
+    CommandPalette,
 }
 
 impl Action {
-    pub const ALL: [Action; 20] = [
+    pub const ALL: [Action; 21] = [
         Action::Copy,
         Action::Paste,
         Action::NewSession,
@@ -497,6 +498,7 @@ impl Action {
         Action::PrevPrompt,
         Action::NextPrompt,
         Action::CopyLastOutput,
+        Action::CommandPalette,
     ];
 
     pub fn label(self) -> &'static str {
@@ -521,6 +523,7 @@ impl Action {
             Action::PrevPrompt => "Previous prompt",
             Action::NextPrompt => "Next prompt",
             Action::CopyLastOutput => "Copy last command output",
+            Action::CommandPalette => "Command palette",
         }
     }
 
@@ -549,6 +552,7 @@ impl Action {
             Action::PrevPrompt => if mac { "cmd+up" } else { "ctrl+shift+up" },
             Action::NextPrompt => if mac { "cmd+down" } else { "ctrl+shift+down" },
             Action::CopyLastOutput => if mac { "cmd+shift+o" } else { "ctrl+shift+o" },
+            Action::CommandPalette => if mac { "cmd+shift+p" } else { "ctrl+shift+p" },
         }
     }
 }

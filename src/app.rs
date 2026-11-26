@@ -24,6 +24,7 @@ use std::collections::HashMap;
 
 use crate::ai_monitor::now_ms;
 use crate::chrome::{self, ChromeInput, ChromeOutput, ChromeState, UiAction, UsageView};
+use crate::palette::{self, Command, PaletteState};
 use crate::settings_ui::{self, SettingsInput, SettingsOutput, SettingsState};
 use crate::config::{
     Action, AppConfig, ConfigFile, ConfigPaths, ConfigWatcher, Decorations, FontConfig, Reload, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
@@ -32,7 +33,7 @@ use crate::config::{
 use crate::input::{self, KeyModes, MouseButton, MouseEventKind, WheelAction};
 use crate::renderer::{CursorDraw, EguiFrame, PaneFrame, Renderer};
 use crate::resources::ResourceMonitor;
-use crate::session::{GridSnapshot, SessionId, SessionManager, SpawnRequest, USAGE_TAB};
+use crate::session::{GridSnapshot, SessionId, SessionManager, SessionSummary, SpawnRequest, USAGE_TAB};
 use crate::stats_ui::{self, StatsInput, StatsState};
 use crate::theme::{Theme, ThemeRegistry};
 use crate::usage_stats::UsageStats;
@@ -92,6 +93,7 @@ pub struct App {
     _watcher: Option<ConfigWatcher>,
     gfx: Option<Gfx>,
     chrome: ChromeState,
+    palette: PaletteState,
     settings: SettingsState,
     /// Usage dashboard tab: view state, and its last computed stats keyed by
     /// (store generation, view state, minute).
@@ -161,6 +163,7 @@ impl App {
             _watcher: watcher,
             gfx: None,
             chrome: ChromeState::default(),
+            palette: PaletteState::default(),
             settings: SettingsState::default(),
             stats: StatsState::default(),
             usage_cache: None,
@@ -487,6 +490,41 @@ impl App {
                     let _ = cb.set_text(text);
                 }
             }
+            Action::CommandPalette => self.palette.toggle(),
+        }
+        self.request_redraw();
+    }
+
+    fn palette_items(&self, summaries: &[SessionSummary]) -> Vec<palette::Item> {
+        let item = |command, label: String, hint: String| palette::Item { command, label, hint };
+        let actions = Action::ALL.into_iter().filter(|a| *a != Action::CommandPalette).map(|a| {
+            let shortcut = self.config.keybindings.combo(a).map(|c| c.display()).unwrap_or_default();
+            item(Command::Action(a), a.label().to_owned(), shortcut)
+        });
+        let agents = self.config.agents.iter().map(|p| item(Command::NewSession(Some(p.name.clone())), format!("New {} session", p.name), String::new()));
+        let sessions = summaries.iter().map(|s| item(Command::Focus(s.id), format!("Go to {}", s.tab_label()), s.project_name.clone()));
+        let archived = self.sessions.archived().iter().enumerate().map(|(i, a)| item(Command::Restore(i), format!("Restore {}", a.task.as_deref().unwrap_or(&a.title)), a.project.clone()));
+        let themes = self.themes.themes().iter().map(|t| {
+            let hint = if t.id == self.theme.id { "current" } else { "" };
+            item(Command::Theme(t.id.clone()), format!("Theme: {}", t.name), hint.to_owned())
+        });
+        actions.chain(agents).chain(sessions).chain(archived).chain(themes).collect()
+    }
+
+    fn run_command(&mut self, command: Command) {
+        match command {
+            Command::Action(action) => self.perform(action),
+            Command::NewSession(profile) => self.apply_ui_action(UiAction::NewSession { profile }),
+            Command::Focus(id) => self.apply_ui_action(UiAction::FocusSession(id)),
+            Command::Restore(index) => self.apply_ui_action(UiAction::RestoreArchived(index)),
+            Command::Theme(id) => {
+                let mut config = self.config.clone();
+                config.appearance.theme = id;
+                self.apply_config(config);
+                if let Err(e) = self.config_file.save(&self.config) {
+                    self.error = Some(e.to_string());
+                }
+            }
         }
         self.request_redraw();
     }
@@ -636,7 +674,7 @@ impl App {
     }
 
     /// Token usage for each session running a known agent.
-    fn usage_views(&self, summaries: &[crate::session::SessionSummary]) -> HashMap<SessionId, UsageView> {
+    fn usage_views(&self, summaries: &[SessionSummary]) -> HashMap<SessionId, UsageView> {
         let store = self.monitor.store().read();
         let now = now_ms();
         let mut views = HashMap::new();
@@ -766,7 +804,7 @@ impl App {
     }
 
     fn on_mouse_button(&mut self, state: ElementState, button: WinitButton) -> bool {
-        if self.settings.open {
+        if self.settings.open || self.palette.open {
             return false;
         }
         let (x, y) = (self.mouse.pos.x, self.mouse.pos.y);
@@ -863,7 +901,7 @@ impl App {
     }
 
     fn on_wheel(&mut self, delta: MouseScrollDelta) -> bool {
-        if self.settings.open {
+        if self.settings.open || self.palette.open {
             return false;
         }
         let (x, y) = (self.mouse.pos.x, self.mouse.pos.y);
@@ -964,8 +1002,10 @@ impl App {
             }
         }
 
+        let palette_items = if self.palette.open { self.palette_items(&summaries) } else { Vec::new() };
+        let mut picked = None;
         let banner = self.error.clone().or_else(|| self.config_error.as_ref().map(|e| format!("config.toml: {e}")));
-        let Self { gfx, chrome, sessions, workspace, config, theme, themes, sidebar_visible, settings, font_families, stats, .. } = self;
+        let Self { gfx, chrome, palette, sessions, workspace, config, theme, themes, sidebar_visible, settings, font_families, stats, .. } = self;
         let Some(g) = gfx.as_mut() else { return };
         let scrolled: Vec<SessionId> = workspace.visible_sessions().into_iter().filter(|id| sessions.get(*id).is_some_and(|s| s.is_scrolled())).collect();
         let ui_colors = theme.ui();
@@ -1019,6 +1059,9 @@ impl App {
             }
             if settings.open {
                 settings_out = settings_ui::show(ui.ctx(), settings, &settings_input);
+            }
+            if palette.open {
+                picked = palette::show(ui.ctx(), palette, &palette_items, &ui_colors);
             }
         });
         g.egui_state.handle_platform_output(&g.window, full.platform_output);
@@ -1085,6 +1128,9 @@ impl App {
 
         for action in out.actions {
             self.apply_ui_action(action);
+        }
+        if let Some(command) = picked {
+            self.run_command(command);
         }
         if self.stats != stats_before {
             // This frame drew stats for the old view; show the new one.

@@ -1177,7 +1177,7 @@ fn empty_state(ui: &mut egui::Ui, area: Rect, input: &ChromeInput<'_>, out: &mut
 impl SessionSummary {
     /// Tab label: a name the user gave, else the task an agent reported
     /// (OSC title), else the session name.
-    fn tab_label(&self) -> String {
+    pub fn tab_label(&self) -> String {
         if !self.renamed && self.subtitle != self.state.label() { self.subtitle.clone() } else { self.title.clone() }
     }
 }
