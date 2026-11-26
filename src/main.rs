@@ -13,6 +13,7 @@ mod config;
 mod input;
 mod links;
 mod osc;
+mod palette;
 mod paste;
 mod prompts;
 mod pty;

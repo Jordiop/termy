@@ -26,6 +26,7 @@ cargo run --release
 | Next pane | ⌘] | Ctrl+Shift+] |
 | Toggle sidebar | ⌘B | Ctrl+Shift+B |
 | Search sessions | ⌘K | Ctrl+Shift+K |
+| Command palette | ⇧⌘P | Ctrl+Shift+P |
 | Settings | ⌘, | Ctrl+, |
 | Usage dashboard | ⇧⌘U | Ctrl+Shift+U |
 | Copy / paste | ⌘C / ⌘V | Ctrl+Shift+C / Ctrl+Shift+V |
@@ -37,6 +38,10 @@ cargo run --release
 On Windows/Linux, letter shortcuts use Ctrl+Shift so plain Ctrl+letter keeps
 reaching the shell. Everything is rebindable in Settings → Keybindings (press
 the new combination) or in `[keybindings]`.
+
+**Command palette**: every action, new agent sessions, open and archived
+sessions and themes in one list. Type to fuzzy-filter, ↑/↓ and Enter to run,
+Escape to close; commands you ran recently come first.
 
 **Tabs**: double-click a tab (or a sidebar card) to rename it; Enter saves,
 Escape cancels, an empty name restores the automatic one. Right-click for
@@ -127,7 +132,7 @@ termy never opens a network connection.
 ## Development
 
 ```sh
-cargo test     # 116 tests: config, themes, PTY, VT emulation, prompt marks, session state, links, token parsing, usage stats, layout, input
+cargo test     # 118 tests: config, themes, PTY, VT emulation, prompt marks, session state, links, command palette, token parsing, usage stats, layout, input
 cargo clippy --all-targets
 ```
 
