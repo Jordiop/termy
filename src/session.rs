@@ -108,20 +108,28 @@ fn program_name(program: &str) -> String {
 /// the PTY's main process, so its exit ends the session.
 pub fn build_command(profile: Option<&AgentProfile>, shell: (String, Vec<String>)) -> (String, Vec<String>) {
     let Some(profile) = profile else { return shell };
-    let (shell_program, _) = shell;
+    login_shell_command_with(&shell.0, &profile.command, &profile.args)
+        .unwrap_or_else(|| (profile.command.clone(), profile.args.clone()))
+}
+
+/// `program args…` run through the user's login shell (Unix), for the `PATH`
+/// a GUI app doesn't get. `None` on Windows or with an unknown shell.
+pub fn login_shell_command(program: &str, args: &[String]) -> Option<(String, Vec<String>)> {
+    login_shell_command_with(&default_shell().0, program, args)
+}
+
+fn login_shell_command_with(shell: &str, program: &str, args: &[String]) -> Option<(String, Vec<String>)> {
     if cfg!(windows) {
-        return (profile.command.clone(), profile.args.clone());
+        return None;
     }
-    let mut args = vec!["-l".to_owned(), "-c".to_owned()];
-    match program_name(&shell_program).as_str() {
-        "zsh" | "bash" | "sh" | "dash" | "ksh" => args.push(r#"exec "$0" "$@""#.to_owned()),
-        "fish" => args.push("exec $argv".to_owned()),
-        // Unknown shell syntax: run the agent directly.
-        _ => return (profile.command.clone(), profile.args.clone()),
-    }
-    args.push(profile.command.clone());
-    args.extend(profile.args.iter().cloned());
-    (shell_program, args)
+    let script = match program_name(shell).as_str() {
+        "zsh" | "bash" | "sh" | "dash" | "ksh" => r#"exec "$0" "$@""#,
+        "fish" => "exec $argv",
+        _ => return None,
+    };
+    let mut full = vec!["-l".to_owned(), "-c".to_owned(), script.to_owned(), program.to_owned()];
+    full.extend(args.iter().cloned());
+    Some((shell.to_owned(), full))
 }
 
 /// zsh reads its startup files from `$ZDOTDIR`: point it at termy's
