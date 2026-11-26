@@ -31,6 +31,8 @@ cargo run --release
 | Copy / paste | ⌘C / ⌘V | Ctrl+Shift+C / Ctrl+Shift+V |
 | Font size + / − / reset | ⌘= / ⌘- / ⌘0 | Ctrl+= / Ctrl+- / Ctrl+0 |
 | Reload config | ⇧⌘R | Ctrl+Shift+R |
+| Previous / next prompt | ⌘↑ / ⌘↓ | Ctrl+Shift+↑ / Ctrl+Shift+↓ |
+| Copy last command output | ⇧⌘O | Ctrl+Shift+O |
 
 On Windows/Linux, letter shortcuts use Ctrl+Shift so plain Ctrl+letter keeps
 reaching the shell. Everything is rebindable in Settings → Keybindings (press
@@ -39,6 +41,14 @@ the new combination) or in `[keybindings]`.
 **Tabs**: double-click a tab (or a sidebar card) to rename it; Enter saves,
 Escape cancels, an empty name restores the automatic one. Right-click for
 Rename / Reset name / Close.
+
+**Shell integration** (zsh): termy loads a small script into zsh sessions
+that marks each prompt (OSC 133) and reports the working directory (OSC 7).
+Prompts get a mark in the left margin, red when the command failed; you can
+jump between prompts and copy the last command's output, and new tabs open in
+the directory you `cd`'d to. Your own `.zshenv`/`.zshrc` load as usual. Other
+shells that emit OSC 133 themselves get the same features. Turn it off with
+`shell_integration = false` in `[terminal]`.
 
 **Images**: paste copies an image as a PNG in the temp folder and pastes its
 path, which Claude Code and Codex attach as an image. Copied files paste their
@@ -59,7 +69,7 @@ comments and formatting.
 * `[font]` family, size, line height, ligatures
 * `[cursor]` shape (`block` / `beam` / `underline`), blink
 * `[terminal]` shell and args, working directory, scrollback, scroll speed,
-  `option_as_alt` (macOS), extra environment variables
+  `option_as_alt` (macOS), `shell_integration`, extra environment variables
 * `[appearance]` `theme`: one of `dark-oled`, `ghostty-dark`, `catppuccin-mocha`,
   `tokyo-night`, `gruvbox-dark`, `solarized-light`, or your own
   `~/.config/termy/themes/<name>.toml` (same format as `assets/themes/`)
@@ -100,7 +110,7 @@ termy never opens a network connection.
 ## Development
 
 ```sh
-cargo test     # 84 tests: config, themes, PTY, VT emulation, token parsing, usage stats, layout, input
+cargo test     # 109 tests: config, themes, PTY, VT emulation, prompt marks, token parsing, usage stats, layout, input
 cargo clippy --all-targets
 ```
 

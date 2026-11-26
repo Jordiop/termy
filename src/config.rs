@@ -242,6 +242,9 @@ pub struct TerminalConfig {
     /// macOS: send Option+key as Meta (ESC prefix) instead of composing
     /// characters (ñ, ´, €…). Always on for Windows/Linux Alt.
     pub option_as_alt: bool,
+    /// Load termy's shell integration (prompt marks, working directory) into
+    /// zsh sessions.
+    pub shell_integration: bool,
     pub env: BTreeMap<String, String>,
 }
 
@@ -254,6 +257,7 @@ impl Default for TerminalConfig {
             scroll_multiplier: 3.0,
             activity_timeout_ms: 1_500,
             option_as_alt: false,
+            shell_integration: true,
             env: BTreeMap::new(),
         }
     }
@@ -466,10 +470,13 @@ pub enum Action {
     DecreaseFont,
     ResetFont,
     ReloadConfig,
+    PrevPrompt,
+    NextPrompt,
+    CopyLastOutput,
 }
 
 impl Action {
-    pub const ALL: [Action; 17] = [
+    pub const ALL: [Action; 20] = [
         Action::Copy,
         Action::Paste,
         Action::NewSession,
@@ -487,6 +494,9 @@ impl Action {
         Action::DecreaseFont,
         Action::ResetFont,
         Action::ReloadConfig,
+        Action::PrevPrompt,
+        Action::NextPrompt,
+        Action::CopyLastOutput,
     ];
 
     pub fn label(self) -> &'static str {
@@ -508,6 +518,9 @@ impl Action {
             Action::DecreaseFont => "Decrease font size",
             Action::ResetFont => "Reset font size",
             Action::ReloadConfig => "Reload config",
+            Action::PrevPrompt => "Previous prompt",
+            Action::NextPrompt => "Next prompt",
+            Action::CopyLastOutput => "Copy last command output",
         }
     }
 
@@ -533,6 +546,9 @@ impl Action {
             Action::DecreaseFont => if mac { "cmd+minus" } else { "ctrl+minus" },
             Action::ResetFont => if mac { "cmd+0" } else { "ctrl+0" },
             Action::ReloadConfig => if mac { "cmd+shift+r" } else { "ctrl+shift+r" },
+            Action::PrevPrompt => if mac { "cmd+up" } else { "ctrl+shift+up" },
+            Action::NextPrompt => if mac { "cmd+down" } else { "ctrl+shift+down" },
+            Action::CopyLastOutput => if mac { "cmd+shift+o" } else { "ctrl+shift+o" },
         }
     }
 }
