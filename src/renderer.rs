@@ -63,6 +63,8 @@ pub struct PaneFrame<'a> {
     pub origin: [f32; 2],
     pub snapshot: &'a GridSnapshot,
     pub cursor: CursorDraw,
+    /// Hovered link to underline: (row, first col, last col).
+    pub link: &'a [(usize, usize, usize)],
 }
 
 /// egui output to composite on top.
@@ -690,6 +692,14 @@ impl Renderer {
                     if cell.flags.contains(Flags::STRIKEOUT) {
                         quads.push(Quad::new(x, y + (m.height / 2.0).round(), w, line, cell.fg, 1.0));
                     }
+                }
+            }
+
+            for &(row, first, last) in pane.link {
+                let y = oy + row as f32 * m.height + m.height - line;
+                for col in first..=last {
+                    let fg = snap.cells[row * snap.cols + col].fg;
+                    quads.push(Quad::new(ox + col as f32 * m.width, y, m.width, line, fg, 1.0));
                 }
             }
 

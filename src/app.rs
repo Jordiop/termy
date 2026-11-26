@@ -30,6 +30,7 @@ use crate::config::{
     WatchEvent,
 };
 use crate::input::{self, KeyModes, MouseButton, MouseEventKind, WheelAction};
+use crate::links::{self, Link, LinkDetector};
 use crate::renderer::{CursorDraw, EguiFrame, PaneFrame, Renderer};
 use crate::resources::ResourceMonitor;
 use crate::session::{GridSnapshot, SavedTab, SessionId, SessionManager, SessionSummary, SpawnRequest, USAGE_TAB};
@@ -112,6 +113,9 @@ pub struct App {
     /// Last frame's pane-divider grab areas (physical px).
     dividers: Vec<Rect>,
     mouse: MouseState,
+    links: LinkDetector,
+    /// Link under the mouse while Cmd/Ctrl is held (underlined, clickable).
+    hover_link: Option<(SessionId, Link)>,
     blink_epoch: Instant,
     clipboard: Option<arboard::Clipboard>,
     egui_repaint_at: Option<Instant>,
@@ -176,6 +180,8 @@ impl App {
             panes: Vec::new(),
             dividers: Vec::new(),
             mouse: MouseState::default(),
+            links: LinkDetector::new(),
+            hover_link: None,
             blink_epoch: Instant::now(),
             clipboard: None,
             egui_repaint_at: None,
@@ -857,6 +863,14 @@ impl App {
         if let Some(s) = self.sessions.get(id) {
             s.clear_attention();
         }
+        if button == MouseButton::Left
+            && let Some((_, link)) = self.link_under_mouse()
+        {
+            if let Err(e) = links::open(&link.target, self.config.links.editor.as_deref()) {
+                self.error = Some(e);
+            }
+            return true;
+        }
 
         // Apps with mouse tracking get the click (Shift forces selection).
         if let Some((sgr, _)) = self.mouse_mode(id).filter(|_| !self.modifiers.shift_key()) {
@@ -896,8 +910,42 @@ impl App {
         true
     }
 
+    /// Cmd (macOS) or Ctrl held: links under the mouse are clickable.
+    fn link_modifier(&self) -> bool {
+        if cfg!(target_os = "macos") { self.modifiers.super_key() } else { self.modifiers.control_key() }
+    }
+
+    fn link_under_mouse(&mut self) -> Option<(SessionId, Link)> {
+        if self.settings.open || !self.link_modifier() {
+            return None;
+        }
+        let (x, y) = (self.mouse.pos.x, self.mouse.pos.y);
+        let hit = self.hit(x, y)?;
+        let id = hit.session.filter(|id| *id != USAGE_TAB)?;
+        let (row, col, _) = self.grid_point(&hit, x, y);
+        let session = self.sessions.get(id)?;
+        let cwd = session.current_dir();
+        let detector = &mut self.links;
+        let link = session.with_term(|t| {
+            let point = Point::new(Line(row as i32 - t.grid().display_offset() as i32), Column(col));
+            detector.link_at(t, point, &cwd)
+        });
+        link.map(|l| (id, l))
+    }
+
+    fn update_hover_link(&mut self) {
+        let link = self.link_under_mouse();
+        if link != self.hover_link {
+            self.hover_link = link;
+            self.request_redraw();
+        }
+    }
+
     fn on_cursor_moved(&mut self, pos: PhysicalPosition<f64>) {
         self.mouse.pos = pos;
+        if self.mouse.selecting.is_none() {
+            self.update_hover_link();
+        }
         if let Some(id) = self.mouse.selecting
             && let Some(hit) = self.panes.iter().copied().find(|p| p.session == Some(id))
         {
@@ -926,6 +974,8 @@ impl App {
         if self.settings.open {
             return false;
         }
+        // The text under the mouse moves: found again on the next mouse move.
+        self.hover_link = None;
         let (x, y) = (self.mouse.pos.x, self.mouse.pos.y);
         let Some(hit) = self.hit(x, y) else { return false };
         let Some(id) = hit.session else { return true };
@@ -1025,7 +1075,7 @@ impl App {
         }
 
         let banner = self.error.clone().or_else(|| self.config_error.as_ref().map(|e| format!("config.toml: {e}")));
-        let Self { gfx, chrome, sessions, workspace, config, theme, themes, sidebar_visible, settings, font_families, stats, .. } = self;
+        let Self { gfx, chrome, sessions, workspace, config, theme, themes, sidebar_visible, settings, font_families, stats, hover_link, .. } = self;
         let Some(g) = gfx.as_mut() else { return };
         let scrolled: Vec<SessionId> = workspace.visible_sessions().into_iter().filter(|id| sessions.get(*id).is_some_and(|s| s.is_scrolled())).collect();
         let ui_colors = theme.ui();
@@ -1080,6 +1130,17 @@ impl App {
             if settings.open {
                 settings_out = settings_ui::show(ui.ctx(), settings, &settings_input);
             }
+            if let Some((_, link)) = hover_link.as_ref() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                // OSC 8 text may hide where it leads: show it.
+                if let (Some(uri), Some(pos)) = (&link.uri, ui.ctx().pointer_hover_pos()) {
+                    let uri: String = uri.chars().take(200).collect();
+                    egui::Area::new(egui::Id::unique("link-uri"))
+                        .order(egui::Order::Tooltip)
+                        .fixed_pos(pos + egui::vec2(12.0, 16.0))
+                        .show(ui.ctx(), |ui| egui::Frame::popup(ui.style()).show(ui, |ui| ui.label(uri)));
+                }
+            }
         });
         g.egui_state.handle_platform_output(&g.window, full.platform_output);
         let ppp = full.pixels_per_point;
@@ -1096,7 +1157,7 @@ impl App {
         let (pad_x, pad_y) = (config.window.padding_x as f32 * ppp, config.window.padding_y as f32 * ppp);
         let focused_pane = workspace.focused_pane();
         let mut hits = Vec::new();
-        let mut snapshots: Vec<(PaneHit, CursorDraw, GridSnapshot)> = Vec::new();
+        let mut snapshots: Vec<(PaneHit, CursorDraw, GridSnapshot, Vec<LinkSpan>)> = Vec::new();
         for view in &out.panes {
             let t = view.terminal;
             let area = Rect::new(t.left() * ppp, t.top() * ppp, t.width() * ppp, t.height() * ppp);
@@ -1112,16 +1173,22 @@ impl App {
             } else {
                 CursorDraw::Unfocused
             };
-            snapshots.push((hit, cursor, session.snapshot(theme)));
+            let snap = session.snapshot(theme);
+            let link = match hover_link.as_ref() {
+                Some((id, link)) if Some(*id) == view.session => link_spans(link, &snap),
+                _ => Vec::new(),
+            };
+            snapshots.push((hit, cursor, snap, link));
         }
         let frames: Vec<PaneFrame<'_>> = snapshots
             .iter()
-            .map(|(hit, cursor, snap)| PaneFrame {
+            .map(|(hit, cursor, snap, link)| PaneFrame {
                 session: hit.session.expect("snapshot has a session"),
                 area: [hit.area.x, hit.area.y, hit.area.w, hit.area.h],
                 origin: hit.origin,
                 snapshot: snap,
                 cursor: *cursor,
+                link,
             })
             .collect();
         let egui_frame = EguiFrame { primitives, textures: full.textures_delta, pixels_per_point: ppp };
@@ -1278,7 +1345,10 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.request_redraw();
             }
-            WindowEvent::ModifiersChanged(mods) => self.modifiers = mods.state(),
+            WindowEvent::ModifiersChanged(mods) => {
+                self.modifiers = mods.state();
+                self.update_hover_link();
+            }
             WindowEvent::Focused(focused) => {
                 self.window_focused = focused;
                 self.request_redraw();
@@ -1305,6 +1375,21 @@ impl ApplicationHandler<UserEvent> for App {
 /// gets light/dark: GTK and Wayland decorations and macOS's native bar honour
 /// it. Windows 11 also takes exact colors: the chrome background, text and
 /// border (older Windows ignores them and keeps the light/dark hint).
+/// One visible row of a link: (row, first col, last col).
+type LinkSpan = (usize, usize, usize);
+
+fn link_spans(link: &Link, snap: &GridSnapshot) -> Vec<LinkSpan> {
+    let offset = snap.display_offset as i32;
+    (link.start.line.0..=link.end.line.0)
+        .filter_map(|line| {
+            let row = usize::try_from(line + offset).ok().filter(|r| *r < snap.rows)?;
+            let first = if line == link.start.line.0 { link.start.column.0 } else { 0 };
+            let last = if line == link.end.line.0 { link.end.column.0 } else { snap.cols - 1 };
+            Some((row, first, last.min(snap.cols - 1)))
+        })
+        .collect()
+}
+
 fn style_title_bar(window: &Window, ui: &crate::theme::UiColors, light: bool) {
     window.set_theme(Some(if light { winit::window::Theme::Light } else { winit::window::Theme::Dark }));
     #[cfg(target_os = "windows")]
