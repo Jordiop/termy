@@ -1,7 +1,7 @@
 //! `SessionManager`: every session owns its PTY, an independent
 //! `alacritty_terminal::Term` fed through `vte::ansi::Processor`, its cwd and
 //! detected project (Git root), an activity state (`Working` / `Waiting` /
-//! `Done`) and attention flags. Closed sessions are archived to disk and can be
+//! `NeedsInput` / `Done`) and attention flags. Closed sessions are archived to disk and can be
 //! restored from the sidebar.
 //!
 //! Threading: the PTY reader thread parses output straight into the `Term`
@@ -44,8 +44,11 @@ pub const USAGE_TAB: SessionId = SessionId::MAX;
 pub enum ActivityState {
     /// Produced output within the activity timeout.
     Working,
-    /// Alive and quiet: waiting for input or approval.
+    /// Alive and quiet.
     Waiting,
+    /// Asked for the user (bell, OSC 9 / 777 notification, agent turn ended)
+    /// and they haven't typed since.
+    NeedsInput,
     /// The process exited.
     Done,
 }
@@ -55,6 +58,7 @@ impl ActivityState {
         match self {
             ActivityState::Working => "Working",
             ActivityState::Waiting => "Waiting",
+            ActivityState::NeedsInput => "Needs you",
             ActivityState::Done => "Done",
         }
     }
@@ -64,6 +68,7 @@ impl ActivityState {
 pub enum SessionFilter {
     #[default]
     All,
+    NeedsInput,
     Waiting,
     Working,
 }
@@ -170,6 +175,16 @@ fn shell_integration_dir() -> Option<&'static Path> {
     .as_deref()
 }
 
+/// Claude Code titles start with a braille spinner while it works and `✳`
+/// once its turn is over: `Some(busy)` for those, `None` for other titles.
+fn claude_busy(title: &str) -> Option<bool> {
+    match title.trim_start().chars().next()? {
+        '✳' => Some(false),
+        c if ('\u{2801}'..='\u{28FF}').contains(&c) => Some(true),
+        _ => None,
+    }
+}
+
 /// Strips spinner glyphs and status markers agents put in front of titles
 /// (`"✳ Fix logos"`, `"⠂ Working"`).
 pub fn clean_title(raw: &str) -> String {
@@ -246,6 +261,9 @@ struct Shared {
     window_size: Mutex<WindowSize>,
     exit: Mutex<Option<ExitInfo>>,
     attention: AtomicBool,
+    needs_input: AtomicBool,
+    /// Message of the notification that set `needs_input`, if any.
+    notice: Mutex<Option<String>>,
     dirty: AtomicBool,
     /// Milliseconds since `epoch` of the last PTY output (0 = never).
     last_output_ms: AtomicU64,
@@ -259,6 +277,12 @@ impl Shared {
         if !self.dirty.swap(true, Ordering::AcqRel) {
             (self.wake)();
         }
+    }
+
+    fn request_input(&self, notice: Option<String>) {
+        *self.notice.lock() = notice;
+        self.needs_input.store(true, Ordering::Release);
+        self.attention.store(true, Ordering::Release);
     }
 
     fn reply(&self, text: impl Into<Vec<u8>>) {
@@ -277,9 +301,15 @@ impl EventListener for Listener {
         let shared = &self.0;
         match event {
             TermEvent::PtyWrite(text) => shared.reply(text),
-            TermEvent::Title(title) => *shared.title.lock() = Some(title),
+            TermEvent::Title(title) => {
+                let mut old = shared.title.lock();
+                if old.as_deref().and_then(claude_busy) == Some(true) && claude_busy(&title) == Some(false) {
+                    shared.request_input(None);
+                }
+                *old = Some(title);
+            }
             TermEvent::ResetTitle => *shared.title.lock() = None,
-            TermEvent::Bell => shared.attention.store(true, Ordering::Release),
+            TermEvent::Bell => shared.request_input(None),
             TermEvent::ClipboardStore(_, text) => *shared.clipboard_request.lock() = Some(text),
             TermEvent::ColorRequest(index, format) => {
                 let p = *shared.palette.lock();
@@ -331,19 +361,23 @@ impl TermState {
     }
 
     /// Parses output, applying shell-integration sequences where they occur.
-    pub fn advance(&mut self, bytes: &[u8]) {
+    /// Returns the last notification (OSC 9 / 777) in `bytes`.
+    pub fn advance(&mut self, bytes: &[u8]) -> Option<String> {
+        let mut notice = None;
         let mut start = 0;
         for (end, event) in self.scanner.feed(bytes) {
             self.parser.advance(&mut self.term, &bytes[start..end]);
             start = end;
             match event {
                 OscEvent::Cwd(path) => self.cwd = Some(path),
+                OscEvent::Notify(text) => notice = Some(text),
                 // Inside a synchronized update the parser buffers text, so a mark would land early.
                 _ if self.parser.sync_timeout().sync_timeout().is_some() => {}
                 _ => self.marks.apply(&mut self.term, &event),
             }
         }
         self.parser.advance(&mut self.term, &bytes[start..]);
+        notice
     }
 
     /// Applies a pending synchronized update (DEC mode 2026) whose timeout
@@ -639,6 +673,8 @@ impl Session {
             window_size: Mutex::new(WindowSize { num_lines: rows, num_cols: cols, cell_width: 0, cell_height: 0 }),
             exit: Mutex::new(None),
             attention: AtomicBool::new(false),
+            needs_input: AtomicBool::new(false),
+            notice: Mutex::new(None),
             dirty: AtomicBool::new(false),
             last_output_ms: AtomicU64::new(0),
             epoch: Instant::now(),
@@ -652,7 +688,9 @@ impl Session {
         let pty = PtyHandle::spawn(
             &opts,
             move |bytes| {
-                out_state.lock().advance(bytes);
+                if let Some(notice) = out_state.lock().advance(bytes) {
+                    out_shared.request_input(Some(notice));
+                }
                 let ms = out_shared.epoch.elapsed().as_millis() as u64;
                 out_shared.last_output_ms.store(ms.max(1), Ordering::Release);
                 out_shared.mark_dirty();
@@ -685,15 +723,21 @@ impl Session {
         self.pty.write(bytes);
     }
 
+    /// Sends what the user typed: they answered, so it no longer needs input.
+    pub fn input(&self, bytes: impl Into<Vec<u8>>) {
+        self.shared.needs_input.store(false, Ordering::Release);
+        self.write(bytes);
+    }
+
     /// Pastes text, using bracketed paste when the program asked for it.
     pub fn paste(&self, text: &str) {
         let bracketed = self.state.lock().term.mode().contains(TermMode::BRACKETED_PASTE);
         if bracketed {
             // Strip any embedded end marker so pasted text can't escape the bracket.
             let clean = text.replace("\x1b[201~", "");
-            self.write(format!("\x1b[200~{clean}\x1b[201~"));
+            self.input(format!("\x1b[200~{clean}\x1b[201~"));
         } else {
-            self.write(text.replace("\r\n", "\r").replace('\n', "\r"));
+            self.input(text.replace("\r\n", "\r").replace('\n', "\r"));
         }
     }
 
@@ -785,9 +829,7 @@ impl Session {
         if self.kind.profile.is_some() {
             return None;
         }
-        let title = self.shared.title.lock();
-        let first = title.as_deref()?.trim_start().chars().next()?;
-        (first == '✳' || ('\u{2801}'..='\u{28FF}').contains(&first)).then_some("claude")
+        self.shared.title.lock().as_deref().and_then(claude_busy).map(|_| "claude")
     }
 
     pub fn title(&self) -> String {
@@ -801,6 +843,13 @@ impl Session {
     pub fn activity(&self, now: Instant, timeout: Duration) -> ActivityState {
         if self.exit_info().is_some() {
             return ActivityState::Done;
+        }
+        if self.shared.needs_input.load(Ordering::Acquire) {
+            return ActivityState::NeedsInput;
+        }
+        // Claude's turn is over even if output arrives (the user's typing echoes).
+        if self.shared.title.lock().as_deref().and_then(claude_busy) == Some(false) {
+            return ActivityState::Waiting;
         }
         let last = self.shared.last_output_ms.load(Ordering::Acquire);
         let since_start = now.saturating_duration_since(self.shared.epoch).as_millis() as u64;
@@ -836,7 +885,14 @@ impl Session {
             id: self.id,
             title: self.title(),
             renamed: self.custom_title.is_some(),
-            subtitle: self.task_title().unwrap_or_else(|| state.label().to_owned()),
+            subtitle: self
+                .shared
+                .notice
+                .lock()
+                .clone()
+                .filter(|_| state == ActivityState::NeedsInput)
+                .or_else(|| self.task_title())
+                .unwrap_or_else(|| state.label().to_owned()),
             icon: self.detected_icon().map(str::to_owned).unwrap_or_else(|| self.kind.icon.clone()),
             profile: self.kind.profile.clone(),
             project_name: self.project.name.clone(),
@@ -885,6 +941,7 @@ pub struct SessionGroup {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FilterCounts {
     pub all: usize,
+    pub needs_input: usize,
     pub waiting: usize,
     pub working: usize,
 }
@@ -892,6 +949,7 @@ pub struct FilterCounts {
 pub fn filter_counts(summaries: &[SessionSummary]) -> FilterCounts {
     FilterCounts {
         all: summaries.len(),
+        needs_input: summaries.iter().filter(|s| s.state == ActivityState::NeedsInput).count(),
         waiting: summaries.iter().filter(|s| s.state == ActivityState::Waiting).count(),
         working: summaries.iter().filter(|s| s.state == ActivityState::Working).count(),
     }
@@ -905,6 +963,7 @@ pub fn group_sessions(summaries: &[SessionSummary], filter: SessionFilter, query
     for s in summaries {
         let state_ok = match filter {
             SessionFilter::All => true,
+            SessionFilter::NeedsInput => s.state == ActivityState::NeedsInput,
             SessionFilter::Waiting => s.state == ActivityState::Waiting,
             SessionFilter::Working => s.state == ActivityState::Working,
         };
@@ -1076,6 +1135,8 @@ mod tests {
             window_size: Mutex::new(WindowSize { num_lines: rows, num_cols: cols, cell_width: 8, cell_height: 16 }),
             exit: Mutex::new(None),
             attention: AtomicBool::new(false),
+            needs_input: AtomicBool::new(false),
+            notice: Mutex::new(None),
             dirty: AtomicBool::new(false),
             last_output_ms: AtomicU64::new(0),
             epoch: Instant::now(),
@@ -1154,9 +1215,10 @@ mod tests {
         st.advance(b"\x1b]0;\xe2\x9c\xb3 Fix logos\x07"); // "✳ Fix logos"
         assert_eq!(shared.title.lock().as_deref(), Some("✳ Fix logos"));
         assert_eq!(clean_title("✳ Fix logos"), "Fix logos");
-        assert!(!shared.attention.load(Ordering::Acquire));
+        // A first `✳` title is Claude starting up, not a finished turn.
+        assert!(!shared.attention.load(Ordering::Acquire) && !shared.needs_input.load(Ordering::Acquire));
         st.advance(b"\x07");
-        assert!(shared.attention.load(Ordering::Acquire));
+        assert!(shared.attention.load(Ordering::Acquire) && shared.needs_input.load(Ordering::Acquire));
         st.advance(b"\x1b]52;c;aGVsbG8=\x07"); // base64("hello")
         assert_eq!(shared.clipboard_request.lock().as_deref(), Some("hello"));
     }
@@ -1249,6 +1311,7 @@ mod tests {
             summary(2, "midterm", Working, "Claude Code"),
             summary(3, "midterm", Working, "midterm"),
             summary(4, "midulive", Waiting, "Claude Code"),
+            summary(5, "midulive", NeedsInput, "Claude Code"),
         ];
         let groups = group_sessions(&all, SessionFilter::All, "");
         let names: Vec<_> = groups.iter().map(|g| g.name.as_str()).collect();
@@ -1264,7 +1327,9 @@ mod tests {
         assert_eq!(searched[0].sessions[0].id, 1);
         assert_eq!(group_sessions(&all, SessionFilter::All, "midul")[0].name, "midulive");
 
-        assert_eq!(filter_counts(&all), FilterCounts { all: 4, waiting: 1, working: 2 });
+        let needs = group_sessions(&all, SessionFilter::NeedsInput, "");
+        assert_eq!(needs[0].sessions.iter().map(|s| s.id).collect::<Vec<_>>(), [5]);
+        assert_eq!(filter_counts(&all), FilterCounts { all: 5, needs_input: 1, waiting: 1, working: 2 });
     }
 
     #[test]
@@ -1310,7 +1375,7 @@ mod tests {
             let _ = wake_tx.send(());
         });
         let mut manager = SessionManager::new(wake, Some(cwd.join("archive.json")));
-        let config = sh_config("printf '\\033]2;\\342\\234\\263 Building\\007\\033[34mblue\\033[0m'; read _; exit 0");
+        let config = sh_config("printf '\\033]2;\\342\\240\\202 Building\\007\\033[34mblue\\033[0m'; read _; exit 0");
         let id = manager
             .spawn(&config, &t, SpawnRequest { cwd: Some(cwd.clone()), cols: 40, rows: 5, ..Default::default() })
             .unwrap();
@@ -1345,6 +1410,30 @@ mod tests {
         let restored = manager.restore(0, &config, &t, 40, 5).unwrap();
         assert_eq!(manager.get(restored).unwrap().cwd, cwd);
         assert!(manager.archived().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn needs_input_until_the_user_types() {
+        let t = theme();
+        let mut manager = SessionManager::new(noop_wake(), None);
+        // Claude ends a turn (spinner → `✳` title), then a notification asks for approval.
+        let config = sh_config(
+            "printf '\\033]0;\\342\\240\\202 Fix logos\\007\\033]0;\\342\\234\\263 Fix logos\\007'; read _; printf '\\033]9;Approve Bash?\\007'; read _; read _",
+        );
+        let id = manager.spawn(&config, &t, SpawnRequest { cols: 40, rows: 5, ..Default::default() }).unwrap();
+        let s = manager.get(id).unwrap();
+        let timeout = Duration::from_secs(60);
+        assert!(wait_until(|| s.activity(Instant::now(), timeout) == ActivityState::NeedsInput));
+        assert_eq!(s.summary(Instant::now(), timeout).subtitle, "Fix logos");
+
+        s.input("\n");
+        assert!(wait_until(|| s.summary(Instant::now(), timeout).subtitle == "Approve Bash?"));
+        assert_eq!(s.activity(Instant::now(), timeout), ActivityState::NeedsInput);
+
+        // With a `✳` title the echo of what the user types isn't work.
+        s.input("\n");
+        assert_eq!(s.activity(Instant::now(), timeout), ActivityState::Waiting);
     }
 
     #[cfg(unix)]
