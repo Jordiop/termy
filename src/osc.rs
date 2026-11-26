@@ -1,5 +1,5 @@
 //! Picks out the OSC sequences `vte` drops (133 prompt marks, 7 working
-//! directory) from raw PTY output. It only reads the bytes: `vte` still parses
+//! directory, 9 / 777 notifications) from raw PTY output. It only reads the bytes: `vte` still parses
 //! all of them, so the caller feeds the parser up to each event's offset and
 //! then applies the event, at the exact point in the stream where it occurred.
 
@@ -20,6 +20,8 @@ pub enum OscEvent {
     CommandEnd(Option<i32>),
     /// `7;file://host/path`: the shell's working directory.
     Cwd(PathBuf),
+    /// `9;message` (iTerm2) or `777;notify;title;body`: the program wants the user.
+    Notify(String),
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +111,16 @@ fn parse(payload: &[u8]) -> Option<OscEvent> {
             }
         }
         "7" => parse_file_url(rest).map(OscEvent::Cwd),
+        // ConEmu uses `9;<number>;…` (progress, tab titles…), not notifications.
+        "9" if !rest.split(';').next()?.bytes().all(|b| b.is_ascii_digit()) => Some(OscEvent::Notify(rest.to_owned())),
+        "777" => {
+            let mut fields = rest.splitn(3, ';');
+            if fields.next()? != "notify" {
+                return None;
+            }
+            let (title, body) = (fields.next().unwrap_or(""), fields.next().unwrap_or(""));
+            Some(OscEvent::Notify(if body.is_empty() { title } else { body }.to_owned()))
+        }
         _ => None,
     }
 }
@@ -180,6 +192,15 @@ mod tests {
         assert_eq!(events, [OscEvent::Cwd(PathBuf::from("/Users/me/my dir"))]);
         assert_eq!(scan(&[b"\x1b]7;file:///tmp\x07"]), [OscEvent::Cwd(PathBuf::from("/tmp"))]);
         assert!(scan(&[b"\x1b]7;http://x/y\x07"]).is_empty());
+    }
+
+    #[test]
+    fn notifications() {
+        assert_eq!(scan(&[b"\x1b]9;Build done\x07"]), [OscEvent::Notify("Build done".into())]);
+        assert_eq!(scan(&[b"\x1b]777;notify;Claude Code;Needs approval\x1b\\"]), [OscEvent::Notify("Needs approval".into())]);
+        assert_eq!(scan(&[b"\x1b]777;notify;Only title\x07"]), [OscEvent::Notify("Only title".into())]);
+        // ConEmu progress and other 777 commands are not notifications.
+        assert!(scan(&[b"\x1b]9;4;1;50\x07\x1b]9;4\x07\x1b]777;precmd\x07"]).is_empty());
     }
 
     #[test]

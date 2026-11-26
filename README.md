@@ -57,6 +57,14 @@ directory and only count when the file exists. URLs open in the browser; files
 open in `[links] editor` (e.g. `editor = "code -g {file}:{line}:{col}"`) or
 else with the system opener, which never runs executables.
 
+**Session state**: each session is *Working* (recent output), *Waiting*
+(quiet) or *Needs you*: the program rang the bell, sent a notification
+(OSC 9 / 777, whose message becomes the card's title), or Claude Code ended
+its turn. It stays there until you type in the session; the sidebar's ⓘ pill
+lists them. Claude Code only sends notifications to terminals it knows, so
+set `"preferredNotifChannel": "iterm2"` in its settings to also get its
+permission prompts.
+
 **Images**: paste copies an image as a PNG in the temp folder and pastes its
 path, which Claude Code and Codex attach as an image. Copied files paste their
 paths, and so do files dropped on the window. On Windows/Linux plain Ctrl+V
@@ -119,7 +127,7 @@ termy never opens a network connection.
 ## Development
 
 ```sh
-cargo test     # 114 tests: config, themes, PTY, VT emulation, prompt marks, links, token parsing, usage stats, layout, input
+cargo test     # 116 tests: config, themes, PTY, VT emulation, prompt marks, session state, links, token parsing, usage stats, layout, input
 cargo clippy --all-targets
 ```
 
