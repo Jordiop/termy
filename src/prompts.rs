@@ -51,7 +51,7 @@ impl PromptMarks {
                 }
                 None
             }
-            OscEvent::Cwd(_) => return,
+            OscEvent::Cwd(_) | OscEvent::Notify(_) => return,
         };
         let link = uri.map(|uri| Hyperlink::new(Some(self.seq), uri.to_owned()));
         term.grid_mut().cursor.template.set_hyperlink(link);

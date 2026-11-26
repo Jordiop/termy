@@ -55,6 +55,14 @@ the directory you `cd`'d to. Your own `.zshenv`/`.zshrc` load as usual. Other
 shells that emit OSC 133 themselves get the same features. Turn it off with
 `shell_integration = false` in `[terminal]`.
 
+**Session state**: each session is *Working* (recent output), *Waiting*
+(quiet) or *Needs you*: the program rang the bell, sent a notification
+(OSC 9 / 777, whose message becomes the card's title), or Claude Code ended
+its turn. It stays there until you type in the session; the sidebar's ⓘ pill
+lists them. Claude Code only sends notifications to terminals it knows, so
+set `"preferredNotifChannel": "iterm2"` in its settings to also get its
+permission prompts.
+
 **Images**: paste copies an image as a PNG in the temp folder and pastes its
 path, which Claude Code and Codex attach as an image. Copied files paste their
 paths, and so do files dropped on the window. On Windows/Linux plain Ctrl+V
@@ -115,7 +123,7 @@ termy never opens a network connection.
 ## Development
 
 ```sh
-cargo test     # 111 tests: config, themes, PTY, VT emulation, prompt marks, token parsing, usage stats, layout, input
+cargo test     # 113 tests: config, themes, PTY, VT emulation, prompt marks, session state, command palette, token parsing, usage stats, layout, input
 cargo clippy --all-targets
 ```
 

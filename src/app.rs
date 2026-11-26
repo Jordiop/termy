@@ -772,7 +772,7 @@ impl App {
             session.with_term(|t| t.selection = None);
             session.scroll_to_bottom();
             session.clear_attention();
-            session.write(bytes);
+            session.input(bytes);
             self.blink_epoch = Instant::now();
             self.request_redraw();
         }
@@ -1213,7 +1213,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::KeyboardInput { .. } => false,
             WindowEvent::Ime(Ime::Commit(text)) if !self.egui_wants_keyboard() => {
                 if let Some(s) = self.focused() {
-                    s.write(text.clone());
+                    s.input(text.clone());
                 }
                 false
             }
