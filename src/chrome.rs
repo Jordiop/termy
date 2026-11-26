@@ -1,5 +1,5 @@
 //! egui chrome (see `docs/DESIGN.md`): collapsible sidebar (new session,
-//! search, All/Waiting/Working pills, sessions grouped by project with token
+//! search, All/Needs you/Waiting/Working pills, sessions grouped by project with token
 //! counters, agent launcher, Archived), one tab bar per pane, a live status /
 //! token footer per pane, the empty state and "Jump to bottom". Terminals are
 //! drawn by `renderer.rs` inside the rectangles this module reports back.
@@ -235,6 +235,12 @@ pub fn paint_icon(painter: &egui::Painter, center: Pos2, radius: f32, icon: &str
             painter.circle_stroke(center, radius * 0.8, stroke);
             painter.line_segment([center, center - Vec2::new(0.0, radius * 0.5)], stroke);
             painter.line_segment([center, center + Vec2::new(radius * 0.4, 0.0)], stroke);
+        }
+        "alert" => {
+            let stroke = Stroke::new(1.2, color);
+            painter.circle_stroke(center, radius * 0.8, stroke);
+            painter.line_segment([center - Vec2::new(0.0, radius * 0.45), center + Vec2::new(0.0, radius * 0.1)], stroke);
+            painter.circle_filled(center + Vec2::new(0.0, radius * 0.4), 0.8, color);
         }
         "spinner" => {
             for i in 0..8 {
@@ -631,7 +637,7 @@ fn sidebar(ui: &mut egui::Ui, state: &mut ChromeState, input: &ChromeInput<'_>, 
     }
 }
 
-/// All / Waiting / Working in three equal slots, so counts appearing or
+/// All / Needs you / Waiting / Working in four equal slots, so counts appearing or
 /// changing never move or wrap them. Labels collapse to icon + count (label
 /// on hover) when a slot is too narrow, which depends on the width only.
 fn filter_pills(ui: &mut egui::Ui, state: &mut ChromeState, input: &ChromeInput<'_>) {
@@ -640,11 +646,12 @@ fn filter_pills(ui: &mut egui::Ui, state: &mut ChromeState, input: &ChromeInput<
     let font = FontId::proportional(10.5);
     let gap = 2.0;
     let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
-    let slot_w = (row.width() - 2.0 * gap) / 3.0;
-    let widest = ui.painter().layout_no_wrap("Working 99".into(), font.clone(), Color32::WHITE).size().x + 26.0;
+    let slot_w = (row.width() - 3.0 * gap) / 4.0;
+    let widest = ui.painter().layout_no_wrap("Needs you 99".into(), font.clone(), Color32::WHITE).size().x + 26.0;
     let compact = widest > slot_w;
     let pills = [
         (SessionFilter::All, "All", counts.all, None),
+        (SessionFilter::NeedsInput, "Needs you", counts.needs_input, Some("alert")),
         (SessionFilter::Waiting, "Waiting", counts.waiting, Some("clock")),
         (SessionFilter::Working, "Working", counts.working, Some("spinner")),
     ];
@@ -804,6 +811,7 @@ fn session_card(ui: &mut egui::Ui, state: &mut ChromeState, s: &SessionSummary, 
 
     let sub_color = match s.state {
         ActivityState::Done => colors.status_done,
+        ActivityState::NeedsInput => colors.status_waiting,
         ActivityState::Waiting if s.attention => colors.status_waiting,
         _ => colors.text_dim,
     };
@@ -1127,6 +1135,7 @@ fn footer(ui: &mut egui::Ui, rect: Rect, sid: SessionId, input: &ChromeInput<'_>
         (ActivityState::Done, Some(code)) if code != 0 => (colors.status_waiting, format!("Exited {code}")),
         (ActivityState::Done, _) => (colors.status_done, "Done".to_owned()),
         (ActivityState::Working, _) => (colors.accent, "Working".to_owned()),
+        (ActivityState::NeedsInput, _) => (colors.status_waiting, "Needs you".to_owned()),
         (ActivityState::Waiting, _) => (if s.attention { colors.status_waiting } else { colors.text_dim }, "Waiting".to_owned()),
     };
     left.circle_filled(Pos2::new(rect.left() + 13.0, y), 3.0, c32(state_color));
