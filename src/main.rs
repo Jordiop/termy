@@ -11,6 +11,7 @@ mod app;
 mod chrome;
 mod config;
 mod input;
+mod links;
 mod osc;
 mod paste;
 mod prompts;

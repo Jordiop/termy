@@ -116,7 +116,7 @@ fn parse(payload: &[u8]) -> Option<OscEvent> {
 /// `file://host/some%20dir` → `/some dir`. The host is ignored: the shell runs
 /// on this machine (ssh sessions report remote paths that won't exist here,
 /// and callers check that).
-fn parse_file_url(url: &str) -> Option<PathBuf> {
+pub fn parse_file_url(url: &str) -> Option<PathBuf> {
     let rest = url.strip_prefix("file://")?;
     let path = &rest[rest.find('/')?..];
     let bytes = path.as_bytes();
