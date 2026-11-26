@@ -47,6 +47,12 @@ Escape to close; commands you ran recently come first.
 Escape cancels, an empty name restores the automatic one. Right-click for
 Rename / Reset name / Close.
 
+**Workspace**: termy reopens the panes and tabs you had open, each in its last
+directory and with the name you gave it. Agent tabs resume their conversation
+(`claude --resume <id>`, `codex resume <id>`), found through the agent's
+usage logs. Terminal contents aren't saved. The layout is kept in
+`workspace.json` next to `config.toml`; close every tab to start fresh.
+
 **Shell integration** (zsh): termy loads a small script into zsh sessions
 that marks each prompt (OSC 133) and reports the working directory (OSC 7).
 Prompts get a mark in the left margin, red when the command failed; you can
@@ -107,6 +113,7 @@ command = "claude"
 icon = "claude"
 color = "#d97757"
 metrics = { kind = "claude_code", path = "~/.claude/projects" }
+# resume_args = ["--resume", "{session_id}"]  # default for claude_code / codex; [] starts fresh
 budget = { weekly_tokens = 5000000, weekly_reset = "mon 09:00" }  # UTC; omit for rolling 7 days
 ```
 
@@ -132,7 +139,7 @@ termy never opens a network connection.
 ## Development
 
 ```sh
-cargo test     # 118 tests: config, themes, PTY, VT emulation, prompt marks, session state, links, command palette, token parsing, usage stats, layout, input
+cargo test     # 121 tests: config, themes, PTY, VT emulation, prompt marks, session state, links, command palette, token parsing, usage stats, layout and restore, input
 cargo clippy --all-targets
 ```
 

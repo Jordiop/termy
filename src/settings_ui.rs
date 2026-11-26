@@ -586,6 +586,7 @@ fn agents(ui: &mut egui::Ui, state: &mut SettingsState, input: &SettingsInput<'_
             color: None,
             metrics: MetricsSource::None,
             budget: TokenBudget::default(),
+            resume_args: None,
         });
     }
 }

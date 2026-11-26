@@ -2,6 +2,8 @@
 //! own tab bar (one session per tab). Pure data — no GPU, no PTY — so every
 //! operation is unit-tested.
 
+use serde::{Deserialize, Serialize};
+
 use crate::session::SessionId;
 
 pub type PaneId = u64;
@@ -25,7 +27,8 @@ impl Rect {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SplitDir {
     /// Side by side (a vertical divider).
     Vertical,
@@ -457,11 +460,119 @@ impl Workspace {
         }
         (panes, dividers)
     }
+
+    /// The split tree with each tab mapped by `tab`. Tabs mapped to `None`
+    /// are left out, and so are the panes they leave empty.
+    pub fn to_layout<T>(&self, mut tab: impl FnMut(SessionId) -> Option<T>) -> Option<Layout<T>> {
+        self.root.as_ref().and_then(|root| self.node_layout(root, &mut tab))
+    }
+
+    fn node_layout<T>(&self, node: &Node, tab: &mut impl FnMut(SessionId) -> Option<T>) -> Option<Layout<T>> {
+        match node {
+            Node::Leaf(id) => {
+                let pane = self.pane(*id)?;
+                let mut tabs = Vec::new();
+                let mut active = 0;
+                for (i, session) in pane.tabs.iter().enumerate() {
+                    if i == pane.active {
+                        active = tabs.len();
+                    }
+                    tabs.extend(tab(*session));
+                }
+                let active = active.min(tabs.len().checked_sub(1)?);
+                Some(Layout::Pane { tabs, active, focused: self.focused == Some(*id) })
+            }
+            Node::Split { dir, children, sizes } => {
+                let (children, sizes): (Vec<_>, Vec<_>) =
+                    children.iter().zip(sizes).filter_map(|(c, s)| Some((self.node_layout(c, tab)?, *s))).unzip();
+                match children.len() {
+                    0 | 1 => children.into_iter().next(),
+                    _ => Some(Layout::Split { dir: *dir, children, sizes }),
+                }
+            }
+        }
+    }
+
+    /// Rebuilds a saved layout, opening each tab with `open` (`None` leaves
+    /// it out). Focus goes to the pane saved as focused, else the first.
+    pub fn from_layout<T>(layout: Layout<T>, mut open: impl FnMut(T) -> Option<SessionId>) -> Self {
+        let mut ws = Self::new();
+        ws.root = ws.build(layout, &mut open);
+        if ws.focused.is_none() {
+            ws.focused = ws.pane_order().first().copied();
+        }
+        ws
+    }
+
+    fn build<T>(&mut self, layout: Layout<T>, open: &mut impl FnMut(T) -> Option<SessionId>) -> Option<Node> {
+        match layout {
+            Layout::Pane { tabs, active, focused } => {
+                let tabs: Vec<SessionId> = tabs.into_iter().filter_map(&mut *open).collect();
+                let active = active.min(tabs.len().checked_sub(1)?);
+                let id = self.next_pane;
+                self.next_pane += 1;
+                self.panes.push(Pane { id, tabs, active });
+                if focused {
+                    self.focused = Some(id);
+                }
+                Some(Node::Leaf(id))
+            }
+            Layout::Split { dir, children, sizes } => {
+                let (children, sizes) = children.into_iter().zip(sizes).filter_map(|(c, s)| Some((self.build(c, open)?, s.max(0.0)))).unzip();
+                Node::split(dir, children, sizes)
+            }
+        }
+    }
+}
+
+/// A saved [`Workspace`]: the split tree with each pane's tabs as `T`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Layout<T> {
+    Pane {
+        tabs: Vec<T>,
+        active: usize,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        focused: bool,
+    },
+    Split { dir: SplitDir, children: Vec<Layout<T>>, sizes: Vec<f32> },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layout_round_trips_and_drops_what_cannot_open() {
+        let mut ws = Workspace::new();
+        ws.add_session(1);
+        ws.add_session(2);
+        ws.activate_tab(ws.focused_pane().unwrap(), 0);
+        ws.split(SplitDir::Vertical, 3);
+        ws.split(SplitDir::Horizontal, 4);
+        ws.focus_session(3);
+        let layout = ws.to_layout(|id| Some(id * 10)).unwrap();
+        let json = serde_json::to_string(&layout).unwrap();
+        assert_eq!(serde_json::from_str::<Layout<u64>>(&json).unwrap(), layout);
+
+        let restored = Workspace::from_layout(layout.clone(), |t| Some(t + 1));
+        assert_eq!(restored.to_layout(|id| Some(id - 1)), Some(layout.clone()));
+        assert_eq!(restored.focused_session(), Some(31));
+        let left = restored.pane(restored.pane_order()[0]).unwrap();
+        assert_eq!((left.tabs.clone(), left.active), (vec![11, 21], 0));
+
+        // Tab 10 fails to open and pane [40] is lost: the split collapses.
+        let partial = Workspace::from_layout(layout, |t| (t != 10 && t != 40).then_some(t));
+        assert_eq!(partial.to_layout(Some), Some(Layout::Split {
+            dir: SplitDir::Vertical,
+            children: vec![
+                Layout::Pane { tabs: vec![20], active: 0, focused: false },
+                Layout::Pane { tabs: vec![30], active: 0, focused: true },
+            ],
+            sizes: vec![0.5, 0.5],
+        }));
+        assert!(Workspace::from_layout(Layout::Pane { tabs: vec![1], active: 0, focused: false }, |_| None).is_empty());
+    }
 
     #[test]
     fn first_session_creates_root_pane() {

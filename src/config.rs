@@ -28,6 +28,8 @@ pub struct ConfigPaths {
     pub themes_dir: PathBuf,
     /// Archived (closed) sessions, recoverable from the sidebar.
     pub archive_file: PathBuf,
+    /// Panes and tabs open at quit, reopened at launch.
+    pub workspace_file: PathBuf,
 }
 
 impl ConfigPaths {
@@ -37,6 +39,7 @@ impl ConfigPaths {
             config_file: dir.join("config.toml"),
             themes_dir: dir.join("themes"),
             archive_file: dir.join("archive.json"),
+            workspace_file: dir.join("workspace.json"),
             dir,
         }
     }
@@ -346,6 +349,23 @@ pub struct AgentProfile {
     pub metrics: MetricsSource,
     #[serde(default)]
     pub budget: TokenBudget,
+    /// Extra args that reopen the conversation `{session_id}` when the
+    /// workspace is restored. Unset: from the metrics source (Claude Code,
+    /// Codex); empty: start fresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_args: Option<Vec<String>>,
+}
+
+impl AgentProfile {
+    pub fn resume_args(&self, session_id: &str) -> Vec<String> {
+        let default: &[&str] = match self.metrics {
+            MetricsSource::ClaudeCode { .. } => &["--resume", "{session_id}"],
+            MetricsSource::Codex { .. } => &["resume", "{session_id}"],
+            _ => &[],
+        };
+        let args = self.resume_args.clone().unwrap_or_else(|| default.iter().map(|a| a.to_string()).collect());
+        args.iter().map(|a| a.replace("{session_id}", session_id)).collect()
+    }
 }
 
 fn default_icon() -> String {
@@ -435,6 +455,7 @@ pub fn default_agents() -> Vec<AgentProfile> {
             color: Rgb::from_hex("#d97757"),
             metrics: MetricsSource::ClaudeCode { path: "~/.claude/projects".into() },
             budget: TokenBudget::default(),
+            resume_args: None,
         },
         AgentProfile {
             name: "Codex".into(),
@@ -444,6 +465,7 @@ pub fn default_agents() -> Vec<AgentProfile> {
             color: Rgb::from_hex("#10a37f"),
             metrics: MetricsSource::Codex { path: "~/.codex/sessions".into() },
             budget: TokenBudget::default(),
+            resume_args: None,
         },
         AgentProfile {
             name: "Gemini CLI".into(),
@@ -453,6 +475,7 @@ pub fn default_agents() -> Vec<AgentProfile> {
             color: Rgb::from_hex("#4796e3"),
             metrics: MetricsSource::GeminiCli { path: "~/.gemini/tmp".into() },
             budget: TokenBudget::default(),
+            resume_args: None,
         },
     ]
 }
@@ -865,7 +888,7 @@ fn hash_str(s: &str) -> u64 {
 
 /// Write to a temp file and rename, so a crash never leaves a half-written
 /// config. Symlinks (dotfile managers) are resolved and written through.
-fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
@@ -983,6 +1006,18 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn resume_args_follow_the_agent_unless_set() {
+        let agents = default_agents();
+        assert_eq!(agents[0].resume_args("abc"), ["--resume", "abc"]);
+        assert_eq!(agents[1].resume_args("abc"), ["resume", "abc"]);
+        assert!(agents[2].resume_args("abc").is_empty());
+        let custom = AgentProfile { resume_args: Some(vec!["-r".into(), "id={session_id}".into()]), ..agents[2].clone() };
+        assert_eq!(custom.resume_args("abc"), ["-r", "id=abc"]);
+        let off = AgentProfile { resume_args: Some(vec![]), ..agents[0].clone() };
+        assert!(off.resume_args("abc").is_empty());
+    }
 
     #[test]
     fn default_config_roundtrips() {
